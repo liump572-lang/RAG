@@ -1,0 +1,63 @@
+# Environment config with secrets
+.env
+docker/.env
+!docker/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+mysql_data/
+redis_data/
+neo4j_data/
+neo4j_logs/
+chromadb_data/
+uploads_data/
+
+# Uploaded files
+uploads/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Logs
+*.log
+
+# Temp scripts (root only)
+/tmp_*.py
+/check_*.py
+/generate_log.py
+/fill_log.py
+/fix_generate.py
+
+# Design docs (binary, not suitable for git)
+*.docx
+
+# Reference materials
+资料/
+
+# Office temp files
+~$*
+*.tmp
