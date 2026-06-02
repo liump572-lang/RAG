@@ -281,7 +281,9 @@ async function sendMessage() {
       if (value) {
         buffer += decoder.decode(value, { stream: true })
       }
-      const lines = buffer.split('\n\n')
+      // SSE uses CRLF by default, while some proxies normalize it to LF.
+      // Accept both forms so token events render immediately.
+      const lines = buffer.split(/\r?\n\r?\n/)
       buffer = lines.pop() || ''
       for (const line of lines) {
         if (line.startsWith('data: ')) {
@@ -330,11 +332,11 @@ async function sendMessage() {
 
     // Refresh from server to get proper IDs and sources
     if (resultConvId) {
-      refreshAfterAnswer(resultConvId)
+      await refreshAfterAnswer(resultConvId)
     } else if (activeConvId.value) {
-      refreshAfterAnswer(activeConvId.value)
+      await refreshAfterAnswer(activeConvId.value)
     } else {
-      fetchConversations()
+      await fetchConversations()
     }
   } catch (e) {
     if (!assistantSaved) {
