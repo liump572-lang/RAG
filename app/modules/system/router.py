@@ -20,10 +20,10 @@ from app.modules.system.service import SystemConfigService
 router = APIRouter()
 
 AVAILABLE_MODELS = [
-    {"value": "deepseek-chat", "label": "DeepSeek Chat", "description": "通用对话模型，兼顾速度与质量"},
     {"value": "deepseek-v4-flash", "label": "DeepSeek V4 Flash", "description": "极速响应，适合简单问答"},
     {"value": "deepseek-v4-pro", "label": "DeepSeek V4 Pro", "description": "旗舰模型，最强推理能力"},
-    {"value": "deepseek-reasoner", "label": "DeepSeek Reasoner", "description": "深度推理，适合复杂问题"},
+    {"value": "deepseek-chat", "label": "DeepSeek Chat（兼容旧配置）", "description": "旧别名，将于 2026-07-24 弃用"},
+    {"value": "deepseek-reasoner", "label": "DeepSeek Reasoner（兼容旧配置）", "description": "旧别名，将于 2026-07-24 弃用"},
 ]
 
 

@@ -803,6 +803,7 @@ body {
   padding: 16px 20px;
   border-top: 1px solid var(--border);
   background: rgba(15, 15, 26, 0.4);
+  position: relative;
 }
 .chat-input-wrap input {
   flex: 1;

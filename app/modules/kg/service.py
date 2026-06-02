@@ -94,8 +94,22 @@ class KgService:
     def create_relation(db: Session, source_id: int, target_id: int, relation_type: str, description: str = None) -> Optional[KnowledgeRelation]:
         source = db.query(KnowledgePoint).filter(KnowledgePoint.id == source_id).first()
         target = db.query(KnowledgePoint).filter(KnowledgePoint.id == target_id).first()
-        if not source or not target:
+        if not source or not target or source.id == target.id or source.subject_id != target.subject_id:
             return None
+
+        existing = db.query(KnowledgeRelation).filter(
+            KnowledgeRelation.source_node_id == source_id,
+            KnowledgeRelation.target_node_id == target_id,
+            KnowledgeRelation.relation_type == relation_type,
+        ).first()
+        if existing:
+            try:
+                neo4j_create_node(source.id, source.name, source.subject_id)
+                neo4j_create_node(target.id, target.name, target.subject_id)
+                neo4j_create_relation(source_id, target_id, relation_type, description or existing.description)
+            except Exception:
+                pass
+            return existing
 
         rel = KnowledgeRelation(
             source_node_id=source_id,
@@ -108,6 +122,8 @@ class KgService:
         db.refresh(rel)
 
         try:
+            neo4j_create_node(source.id, source.name, source.subject_id)
+            neo4j_create_node(target.id, target.name, target.subject_id)
             neo4j_create_relation(source_id, target_id, relation_type, description)
         except Exception:
             pass

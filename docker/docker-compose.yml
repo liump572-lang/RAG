@@ -101,7 +101,7 @@ services:
       - CHROMA_PORT=8000
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - DEEPSEEK_API_BASE=${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}
-      - LLM_MODEL=${LLM_MODEL:-deepseek-v4-pro}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-v4-flash}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-deepseek-embedding}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-this-to-a-random-secret-key}
       - JWT_ALGORITHM=HS256
@@ -140,7 +140,7 @@ services:
       - CHROMA_PORT=8000
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - DEEPSEEK_API_BASE=${DEEPSEEK_API_BASE:-https://api.deepseek.com/v1}
-      - LLM_MODEL=${LLM_MODEL:-deepseek-v4-pro}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-v4-flash}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-deepseek-embedding}
       - UPLOAD_DIR=/app/uploads
     volumes:
@@ -164,8 +164,27 @@ services:
     restart: unless-stopped
     ports:
       - "80:80"
+    volumes:
+      - ../frontend/dist:/usr/share/nginx/html:ro
     depends_on:
       - backend
+
+  frontend-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend.dev
+    container_name: kqa-frontend-dev
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../frontend/src:/app/src
+      - ../frontend/index.html:/app/index.html
+      - ../frontend/vite.config.js:/app/vite.config.js
+    depends_on:
+      - backend
+    profiles:
+      - dev
 
 volumes:
   mysql_data:

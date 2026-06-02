@@ -14,6 +14,9 @@ from app.tasks.celery_app import celery_app
 BATCH_SIZE = 10
 MAX_CHARS_PER_CHUNK = 1200
 GLOBAL_REL_MAX_ENTITIES = 25
+VALID_RELATION_TYPES = {
+    "PREREQUISITE", "NEXT", "RELATED", "CONTAINS", "CONTRAST", "EXAMINED_IN",
+}
 
 
 @celery_app.task(name="kg_task.extract_knowledge", bind=True, max_retries=2, default_retry_delay=60)
@@ -180,11 +183,15 @@ def _dedup_relations(rels: list) -> list:
     seen = set()
     unique = []
     for rel in rels:
-        key = (
-            rel.get("source", "").strip(),
-            rel.get("target", "").strip(),
-            rel.get("type", "RELATED"),
-        )
+        source = rel.get("source", "").strip()
+        target = rel.get("target", "").strip()
+        rel_type = rel.get("type", "RELATED").strip().upper()
+        if not source or not target or source == target or rel_type not in VALID_RELATION_TYPES:
+            continue
+        rel["source"] = source
+        rel["target"] = target
+        rel["type"] = rel_type
+        key = (source, target, rel_type)
         if key not in seen:
             seen.add(key)
             unique.append(rel)
@@ -223,7 +230,7 @@ def _infer_global_relationships(kps: list, doc_title: str, subject_name: str) ->
 要求：
 1. 仔细分析每对知识点之间的可能关系
 2. 关系类型：PREREQUISITE（前置）、NEXT（后继）、RELATED（关联）、CONTAINS（包含）、CONTRAST（对比）、EXAMINED_IN（考点）
-3. 至少找出5个有意义的关系，如果知识点之间有明显的层级或先后关系，必须标注出来
+3. 只保留有明确语义依据的关系；没有可靠联系时不要为了数量强行添加
 4. 只返回确实存在的关系，不要编造不存在的关联
 5. 关系描述应简洁说明两个知识点之间的具体联系（10-40字）
 
@@ -326,6 +333,10 @@ def _store_knowledge_points(db, kps: list, subject_id: int) -> dict:
             if kp.get("description") and not existing.description:
                 existing.description = kp.get("description")
                 db.commit()
+            try:
+                neo4j_create_node(existing.id, existing.name, existing.subject_id)
+            except Exception:
+                pass
             continue
 
         point = KnowledgePoint(
@@ -359,7 +370,9 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
         if not src_id or not tgt_id or src_id == tgt_id:
             continue
 
-        rel_type = rel.get("type", "RELATED")
+        rel_type = rel.get("type", "RELATED").strip().upper()
+        if rel_type not in VALID_RELATION_TYPES:
+            continue
         rel_desc = rel.get("description", "")
 
         existing_rel = (
@@ -372,6 +385,10 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
             .first()
         )
         if existing_rel:
+            try:
+                neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
+            except Exception:
+                pass
             continue
 
         relation = KnowledgeRelation(
@@ -415,6 +432,12 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
 
     if not existing_kps:
         return 0
+
+    for point in existing_kps:
+        try:
+            neo4j_create_node(point.id, point.name, point.subject_id)
+        except Exception:
+            pass
 
     # Select a sample of new entities to link (top by difficulty)
     sorted_new = sorted(new_kps, key=lambda k: k.get("difficulty", 3), reverse=True)
@@ -482,7 +505,9 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
         if not src_id or not tgt_id or src_id == tgt_id:
             continue
 
-        rel_type = rel.get("type", "RELATED")
+        rel_type = rel.get("type", "RELATED").strip().upper()
+        if rel_type not in VALID_RELATION_TYPES:
+            continue
         rel_desc = rel.get("description", "")
 
         existing_rel = (
@@ -495,6 +520,10 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
             .first()
         )
         if existing_rel:
+            try:
+                neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
+            except Exception:
+                pass
             continue
 
         relation = KnowledgeRelation(

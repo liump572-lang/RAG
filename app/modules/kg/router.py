@@ -141,7 +141,7 @@ def create_relation(
         return error_response(403, "无权限")
     rel = KgService.create_relation(db, body.source_id, body.target_id, body.relation_type, body.description)
     if not rel:
-        return error_response(400, "源节点或目标节点不存在")
+        return error_response(400, "源节点和目标节点必须存在、不能相同且需要属于同一科目")
     return success_response(data=RelationResponse.model_validate(rel).model_dump())
 
 
