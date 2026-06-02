@@ -15,6 +15,7 @@
           <el-button type="primary" @click="showAddNode">+ 手动添加</el-button>
           <el-button type="success" @click="showAddEdge">添加关系</el-button>
           <el-button type="warning" @click="showGenerateDoc">生成文档</el-button>
+          <el-button @click="openCandidateDrawer">候选关系审核</el-button>
         </el-form-item>
       </el-form>
     </el-card>
@@ -167,6 +168,38 @@
         <el-button type="primary" :loading="saving" @click="handleSaveEdge">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-drawer v-model="candidateDrawer" title="候选关系审核" size="520px">
+      <div v-loading="candidateLoading">
+        <el-empty v-if="!candidateLoading && !candidates.length" description="暂无待审核候选关系" />
+        <el-card v-for="candidate in candidates" :key="candidate.id" class="candidate-card">
+          <div class="candidate-title">
+            <b>{{ candidate.source_name }}</b>
+            <span>→</span>
+            <b>{{ candidate.target_name }}</b>
+          </div>
+          <div class="candidate-meta">
+            <el-tag size="small">{{ edgeTypeConfig[candidate.relation_type]?.label || candidate.relation_type }}</el-tag>
+            <span>置信度 {{ (candidate.confidence * 100).toFixed(0) }}%</span>
+          </div>
+          <p>{{ candidate.description || '暂无关系说明' }}</p>
+          <div class="candidate-evidence">证据：{{ candidate.evidence_text || '暂无证据文本' }}</div>
+          <div class="candidate-source">来源：{{ candidate.document_title || '未知文档' }}</div>
+          <div class="candidate-actions">
+            <el-button size="small" type="primary" @click="reviewCandidate(candidate.id, true)">批准入图</el-button>
+            <el-button size="small" type="danger" plain @click="reviewCandidate(candidate.id, false)">驳回</el-button>
+          </div>
+        </el-card>
+        <el-pagination
+          v-if="candidateTotal > candidateSize"
+          layout="prev, pager, next"
+          :total="candidateTotal"
+          :page-size="candidateSize"
+          v-model:current-page="candidatePage"
+          @current-change="fetchCandidates"
+        />
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -175,7 +208,7 @@ import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, 
 import { ElMessage, ElNotification } from 'element-plus'
 import { Network } from 'vis-network'
 import 'vis-network/styles/vis-network.css'
-import { getSubgraph, searchSubgraph, createPoint, updatePoint, deletePoint, createRelation, generateDocument, getRebuildStatus, retryFailedRebuildDocuments } from '@/api/kg'
+import { getSubgraph, searchSubgraph, createPoint, updatePoint, deletePoint, createRelation, generateDocument, getRebuildStatus, retryFailedRebuildDocuments, getRelationCandidates, approveRelationCandidate, rejectRelationCandidate } from '@/api/kg'
 import { getSubjects } from '@/api/subjects'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 
@@ -190,6 +223,12 @@ const isSearchMode = ref(false)
 const nodeRelations = ref([])
 const rebuildStatus = ref({ status: 'not_started', total_documents: 0, completed_documents: 0, failed_documents: 0 })
 const retryingRebuild = ref(false)
+const candidateDrawer = ref(false)
+const candidateLoading = ref(false)
+const candidates = ref([])
+const candidatePage = ref(1)
+const candidateSize = 20
+const candidateTotal = ref(0)
 let network = null
 let renderedGraphSignature = ''
 
@@ -272,6 +311,33 @@ async function handleRetryFailedRebuild() {
   } finally {
     retryingRebuild.value = false
   }
+}
+
+async function openCandidateDrawer() {
+  candidateDrawer.value = true
+  candidatePage.value = 1
+  await fetchCandidates()
+}
+
+async function fetchCandidates() {
+  candidateLoading.value = true
+  try {
+    const res = await getRelationCandidates({ status: 'pending', page: candidatePage.value, size: candidateSize })
+    if (res.code === 200) {
+      candidates.value = res.data.items || []
+      candidateTotal.value = res.data.total || 0
+    }
+  } finally {
+    candidateLoading.value = false
+  }
+}
+
+async function reviewCandidate(id, approved) {
+  if (approved) await approveRelationCandidate(id)
+  else await rejectRelationCandidate(id)
+  ElMessage.success(approved ? '候选关系已批准' : '候选关系已驳回')
+  await fetchCandidates()
+  if (approved) fetchGraph()
 }
 
 onActivated(() => {
@@ -790,6 +856,14 @@ async function handleSaveEdge() {
 .rebuild-title { font-weight: 700; color: #334155; }
 .rebuild-progress { margin-left: auto; }
 .rebuild-failed { color: #d97706; }
+
+.candidate-card { margin-bottom: 12px; }
+.candidate-title { display:flex; gap:8px; align-items:center; color:#334155; }
+.candidate-meta { display:flex; gap:10px; align-items:center; margin-top:8px; font-size:12px; color:#64748b; }
+.candidate-card p { margin:10px 0 6px; font-size:13px; color:#475569; }
+.candidate-evidence { padding:8px; border-radius:6px; background:#f8fafc; font-size:12px; line-height:1.6; color:#64748b; }
+.candidate-source { margin-top:6px; font-size:12px; color:#94a3b8; }
+.candidate-actions { display:flex; gap:8px; margin-top:10px; }
 
 .kg-body {
   flex: 1;

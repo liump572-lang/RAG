@@ -17,7 +17,10 @@ from app.common.graph_store import (
 )
 from app.common.llm_client import chat
 from app.config import settings
-from app.models import Document, KgExtractionRun, KgRebuild, KgSyncFailure, KnowledgePoint, KnowledgeRelation, Subject
+from app.models import (
+    Document, KgExtractionRun, KgRebuild, KgSyncFailure, KnowledgePoint,
+    KnowledgeRelation, KnowledgeRelationCandidate, KnowledgeRelationEvidence, Subject,
+)
 
 
 def _record_sync_failure(db: Session, operation: str, entity_type: str, entity_id: int, payload: dict, error: Exception):
@@ -221,6 +224,76 @@ class KgService:
             rebuild.finished_at = None
             db.commit()
         return len(runs)
+
+    @staticmethod
+    def list_relation_candidates(db: Session, status: str = "pending", page: int = 1, size: int = 20):
+        query = (
+            db.query(
+                KnowledgeRelationCandidate,
+                KnowledgePoint.name.label("source_name"),
+                Document.title.label("document_title"),
+            )
+            .join(KnowledgePoint, KnowledgeRelationCandidate.source_node_id == KnowledgePoint.id)
+            .outerjoin(Document, KnowledgeRelationCandidate.document_id == Document.id)
+            .filter(KnowledgeRelationCandidate.status == status)
+        )
+        total = query.count()
+        rows = query.order_by(KnowledgeRelationCandidate.id.desc()).offset((page - 1) * size).limit(size).all()
+        items = []
+        for candidate, source_name, document_title in rows:
+            target = db.query(KnowledgePoint).filter(KnowledgePoint.id == candidate.target_node_id).first()
+            items.append({
+                "id": candidate.id,
+                "source_node_id": candidate.source_node_id,
+                "source_name": source_name,
+                "target_node_id": candidate.target_node_id,
+                "target_name": target.name if target else "",
+                "relation_type": candidate.relation_type,
+                "description": candidate.description,
+                "evidence_text": candidate.evidence_text,
+                "confidence": float(candidate.confidence),
+                "document_id": candidate.document_id,
+                "document_title": document_title,
+                "status": candidate.status,
+            })
+        return items, total
+
+    @staticmethod
+    def review_relation_candidate(db: Session, candidate_id: int, approved: bool, user_id: int) -> bool:
+        candidate = db.query(KnowledgeRelationCandidate).filter(
+            KnowledgeRelationCandidate.id == candidate_id,
+            KnowledgeRelationCandidate.status == "pending",
+        ).first()
+        if not candidate:
+            return False
+        candidate.status = "approved" if approved else "rejected"
+        candidate.reviewed_by = user_id
+        candidate.reviewed_at = datetime.now()
+        if approved:
+            relation = KgService.create_relation(
+                db,
+                candidate.source_node_id,
+                candidate.target_node_id,
+                candidate.relation_type,
+                candidate.description,
+            )
+            if relation:
+                relation.origin = "auto"
+                relation.confidence = candidate.confidence
+                relation.review_status = "approved"
+                db.add(KnowledgeRelationEvidence(
+                    relation_id=relation.id,
+                    document_id=candidate.document_id,
+                    chunk_id=candidate.chunk_id,
+                    source_name=db.query(KnowledgePoint.name).filter(KnowledgePoint.id == candidate.source_node_id).scalar() or "",
+                    target_name=db.query(KnowledgePoint.name).filter(KnowledgePoint.id == candidate.target_node_id).scalar() or "",
+                    relation_type=candidate.relation_type,
+                    evidence_text=candidate.evidence_text,
+                    confidence=candidate.confidence,
+                    prompt_version=candidate.prompt_version,
+                ))
+        db.commit()
+        return True
 
     @staticmethod
     def get_subgraph(subject_id: int = None, depth: int = 2) -> dict:

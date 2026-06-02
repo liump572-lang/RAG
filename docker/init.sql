@@ -241,7 +241,10 @@ INSERT IGNORE INTO system_configs (config_key, config_value, description) VALUES
     ('retrieval.top_k', '10', '检索Top-K数量'),
     ('retrieval.similarity_threshold', '0.75', '相似度阈值'),
     ('chunk.size', '512', '文档分块大小'),
-    ('chunk.overlap', '128', '分块重叠量');
+    ('chunk.overlap', '128', '分块重叠量'),
+    ('chunk.min_chars', '120', '文档最小切块大小'),
+    ('kg.relation_candidate_threshold', '0.2', '关系候选保留阈值'),
+    ('kg.relation_auto_threshold', '0.8', '关系自动入图阈值');
 
 -- 消息通知表
 CREATE TABLE IF NOT EXISTS notifications (
@@ -324,6 +327,41 @@ CREATE TABLE IF NOT EXISTS knowledge_point_sources (
     INDEX idx_kps_point (knowledge_point_id),
     INDEX idx_kps_document (document_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识点来源证据';
+
+CREATE TABLE IF NOT EXISTS knowledge_relation_evidence (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    relation_id BIGINT,
+    document_id BIGINT NOT NULL,
+    chunk_id BIGINT,
+    source_name VARCHAR(100) NOT NULL,
+    target_name VARCHAR(100) NOT NULL,
+    relation_type VARCHAR(30) NOT NULL,
+    evidence_text TEXT,
+    confidence DECIMAL(4,3) NOT NULL DEFAULT 0.800,
+    prompt_version VARCHAR(50) NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_kre_relation (relation_id),
+    INDEX idx_kre_document (document_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识点关系证据';
+
+CREATE TABLE IF NOT EXISTS knowledge_relation_candidates (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    source_node_id BIGINT NOT NULL,
+    target_node_id BIGINT NOT NULL,
+    relation_type VARCHAR(30) NOT NULL,
+    description VARCHAR(255),
+    evidence_text TEXT,
+    confidence DECIMAL(4,3) NOT NULL DEFAULT 0.500,
+    document_id BIGINT,
+    chunk_id BIGINT,
+    prompt_version VARCHAR(50) NOT NULL,
+    status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+    reviewed_by BIGINT,
+    reviewed_at DATETIME,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_krc_status (status),
+    INDEX idx_krc_nodes (source_node_id, target_node_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='候选知识点关系';
 
 CREATE TABLE IF NOT EXISTS kg_rebuilds (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

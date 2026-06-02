@@ -169,7 +169,9 @@ class KbService:
             from app.common.parsers.cleaner import clean_parsed_text, extract_structure_metadata
             raw_text = clean_parsed_text(raw_text)
 
-            min_chunk_chars = 50
+            from app.common.kg_settings import get_kg_settings
+            kg_settings = get_kg_settings(db)
+            min_chunk_chars = kg_settings["chunk.min_chars"]
             if len(raw_text.strip()) < min_chunk_chars:
                 doc.parse_status = "success"
                 doc.chunk_count = 0
@@ -186,13 +188,8 @@ class KbService:
 
             # ── Chunk with structure-aware sizing ──
             from app.common.parsers.chunker import recursive_character_split
-            text_len = len(raw_text)
-            if text_len > 50000:
-                chunk_size, chunk_overlap = 1024, 200
-            elif text_len > 5000:
-                chunk_size, chunk_overlap = 800, 150
-            else:
-                chunk_size, chunk_overlap = 512, 100
+            chunk_size = kg_settings["chunk.size"]
+            chunk_overlap = kg_settings["chunk.overlap"]
 
             chunks = recursive_character_split(raw_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 

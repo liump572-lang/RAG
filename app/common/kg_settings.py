@@ -1,0 +1,50 @@
+from sqlalchemy.orm import Session
+
+from app.models import SystemConfig
+
+
+KG_SETTING_DEFAULTS = {
+    "chunk.min_chars": 120,
+    "chunk.size": 512,
+    "chunk.overlap": 128,
+    "kg.relation_candidate_threshold": 0.2,
+    "kg.relation_auto_threshold": 0.8,
+}
+
+
+def get_kg_settings(db: Session) -> dict:
+    rows = db.query(SystemConfig).filter(SystemConfig.config_key.in_(KG_SETTING_DEFAULTS)).all()
+    values = dict(KG_SETTING_DEFAULTS)
+    for row in rows:
+        default = KG_SETTING_DEFAULTS[row.config_key]
+        try:
+            values[row.config_key] = int(row.config_value) if isinstance(default, int) else float(row.config_value)
+        except (TypeError, ValueError):
+            values[row.config_key] = default
+    return validate_kg_settings(values)
+
+
+def validate_kg_settings(values: dict) -> dict:
+    min_chars = int(values["chunk.min_chars"])
+    chunk_size = int(values["chunk.size"])
+    overlap = int(values["chunk.overlap"])
+    candidate = float(values["kg.relation_candidate_threshold"])
+    automatic = float(values["kg.relation_auto_threshold"])
+
+    if not 20 <= min_chars <= 2000:
+        raise ValueError("最小切块大小必须在 20 至 2000 之间")
+    if not 100 <= chunk_size <= 5000:
+        raise ValueError("目标切块大小必须在 100 至 5000 之间")
+    if min_chars >= chunk_size:
+        raise ValueError("最小切块大小必须小于目标切块大小")
+    if not 0 <= overlap < chunk_size:
+        raise ValueError("重叠大小必须大于等于 0 且小于目标切块大小")
+    if not 0 <= candidate <= automatic <= 1:
+        raise ValueError("候选阈值必须在 0 至自动入图阈值之间")
+    return {
+        "chunk.min_chars": min_chars,
+        "chunk.size": chunk_size,
+        "chunk.overlap": overlap,
+        "kg.relation_candidate_threshold": candidate,
+        "kg.relation_auto_threshold": automatic,
+    }

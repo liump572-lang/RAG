@@ -200,3 +200,43 @@ def retry_failed_rebuild_documents(
         return error_response(403, "无权限")
     count = KgService.retry_failed_rebuild_documents(db)
     return success_response(data={"queued_documents": count})
+
+
+@router.get("/relation-candidates")
+def list_relation_candidates(
+    status: str = Query("pending", pattern="^(pending|approved|rejected)$"),
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    items, total = KgService.list_relation_candidates(db, status, page, size)
+    return paginated_response(items, total, page, size)
+
+
+@router.post("/relation-candidates/{candidate_id}/approve")
+def approve_relation_candidate(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    if not KgService.review_relation_candidate(db, candidate_id, True, current_user.id):
+        return error_response(404, "候选关系不存在或已审核")
+    return success_response(message="候选关系已批准")
+
+
+@router.post("/relation-candidates/{candidate_id}/reject")
+def reject_relation_candidate(
+    candidate_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    if not KgService.review_relation_candidate(db, candidate_id, False, current_user.id):
+        return error_response(404, "候选关系不存在或已审核")
+    return success_response(message="候选关系已驳回")

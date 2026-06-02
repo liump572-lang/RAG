@@ -13,13 +13,15 @@ from app.database import SessionLocal
 from app.config import settings
 from app.models import (
     Document, DocumentChunk, KgExtractionRun, KgRebuild, KgSyncFailure,
-    KnowledgePoint, KnowledgePointSource, KnowledgeRelation, Subject,
+    KnowledgePoint, KnowledgePointSource, KnowledgeRelation,
+    KnowledgeRelationCandidate, KnowledgeRelationEvidence, Subject,
 )
 from app.tasks.celery_app import celery_app
 
-BATCH_SIZE = 10
+BATCH_SIZE = 1
 MAX_CHARS_PER_CHUNK = 1200
 GLOBAL_REL_MAX_ENTITIES = 25
+PROMPT_VERSION = "kg-v3-physical-semantic"
 VALID_RELATION_TYPES = {
     "PREREQUISITE", "NEXT", "RELATED", "CONTAINS", "CONTRAST", "EXAMINED_IN",
 }
@@ -56,6 +58,8 @@ def extract_knowledge_task(self, document_id: int, run_id: int = None):
 
         subject = db.query(Subject).filter(Subject.id == doc.subject_id).first()
         subject_name = subject.name if subject else "未知"
+        from app.common.kg_settings import get_kg_settings
+        kg_settings = get_kg_settings(db)
 
         chunks = (
             db.query(DocumentChunk)
@@ -83,14 +87,18 @@ def extract_knowledge_task(self, document_id: int, run_id: int = None):
 
         for batch_start in range(0, total_chunks, BATCH_SIZE):
             batch = chunks[batch_start:batch_start + BATCH_SIZE]
-            batch_text = _build_batch_text(doc.title, batch, batch_start, total_chunks)
+            batch_text = _build_extraction_text(doc.title, chunks, batch_start)
             try:
-                response = _call_extract_entities(batch_text, subject_name)
+                response = _call_extract_entities(batch_text, subject_name, doc.doc_type)
                 data = _parse_json_response(response)
                 if data:
                     for kp in data.get("knowledge_points", []):
                         kp["_batch"] = f"{batch_start + 1}-{batch_start + len(batch)}"
                         kp["_chunk_id"] = batch[0].id if batch else None
+                    for rel in data.get("relations", []):
+                        rel["_chunk_id"] = batch[0].id if batch else None
+                    if doc.doc_type != "exam":
+                        data["relations"] = [rel for rel in data.get("relations", []) if rel.get("type") != "EXAMINED_IN"]
                     all_kps.extend(data.get("knowledge_points", []))
                     all_rels.extend(data.get("relations", []))
             except Exception:
@@ -119,10 +127,10 @@ def extract_knowledge_task(self, document_id: int, run_id: int = None):
         # ── Phase 3: Store in DB and Neo4j ──
         name_to_id = _store_knowledge_points(db, merged_kps, doc.subject_id, doc.id)
 
-        rel_count = _store_relations(db, merged_rels, name_to_id)
+        rel_count = _store_relations(db, merged_rels, name_to_id, doc.id, kg_settings)
 
         # ── Phase 4: Cross-document linking ──
-        cross_links = _link_to_existing_graph(db, merged_kps, name_to_id, doc.subject_id)
+        cross_links = _link_to_existing_graph(db, merged_kps, name_to_id, doc.subject_id, doc.id, kg_settings)
         rel_count += cross_links
 
         result = {
@@ -150,52 +158,47 @@ def extract_knowledge_task(self, document_id: int, run_id: int = None):
         db.close()
 
 
-def _build_batch_text(doc_title: str, batch: list, batch_start: int, total: int) -> str:
-    parts = []
-    for c in batch:
-        chunk_idx = c.chunk_index
-        content = c.content[:MAX_CHARS_PER_CHUNK]
-        parts.append(f"[段落{chunk_idx + 1}/{total}]\n{content}")
-
-    return (
-        f"文档标题：{doc_title}\n"
-        f"处理批次：段落 {batch_start + 1} - {batch_start + len(batch)} / {total}\n\n"
-        + "\n\n---\n\n".join(parts)
-    )
+def _build_extraction_text(doc_title: str, chunks: list, index: int) -> str:
+    parts = [f"文档标题：{doc_title}"]
+    if index > 0:
+        parts.append(f"[前文，仅用于理解上下文]\n{chunks[index - 1].content[:500]}")
+    parts.append(f"[主切块，实体和证据必须来自这里]\n{chunks[index].content[:MAX_CHARS_PER_CHUNK]}")
+    if index + 1 < len(chunks):
+        parts.append(f"[后文，仅用于理解上下文]\n{chunks[index + 1].content[:500]}")
+    return "\n\n---\n\n".join(parts)
 
 
-def _call_extract_entities(batch_text: str, subject_name: str) -> str:
-    prompt = f"""你是一个知识抽取专家。请从以下文档片段中提取核心知识点和它们之间的关系。
+def _call_extract_entities(batch_text: str, subject_name: str, doc_type: str) -> str:
+    prompt = f"""你是学科知识图谱构建专家。请从主切块中提取细粒度、可解释的实体和关系。
 
 所属科目：{subject_name}
+文档类型：{doc_type}
 
 文档内容：
 {batch_text}
 
-请提取出该片段中涵盖的核心知识点和它们之间的关系。
 要求：
-1. 知识点名称应简洁、准确（2-20字），提取具体的概念、术语、算法、定理等
-2. 每个知识点给出简要描述（30-150字）
-3. 难度等级1-5（1最简单，5最难），根据概念的抽象程度和复杂度判断
-4. 关系类型只能是以下之一：PREREQUISITE（前置条件）、NEXT（后继）、RELATED（关联）、CONTAINS（包含）、CONTRAST（对比）、EXAMINED_IN（考点）
-5. 仔细发现所有知识点之间的关联，包括：
-   - 概念A是学习概念B的前置知识（PREREQUISITE）
-   - 概念B是概念A的后续延伸（NEXT）
-   - 概念A包含子概念B（CONTAINS）
-   - 概念A和概念B互相对比/对立（CONTRAST）
-   - 概念A和概念B在相关领域有关联（RELATED）
-   - 概念A是考试中常考的知识点（EXAMINED_IN）
-6. 只提取文档中明确出现的知识点，不要凭空编造
-7. 尽量识别标准术语的全称和缩写（如"卷积神经网络（CNN）"）
-8. 为每个知识点返回 aliases（别名数组）、evidence（原文依据）和 confidence（0-1）
+1. 只从“主切块”提取实体；前文和后文仅用于消歧，不能作为证据来源。
+2. 实体包括概念、术语、机制、算法、定理、关键组件和重要参数；过滤普通描述词、章节名和过于宽泛的词。
+3. 实体名称应简洁准确（2-30字），优先标准名称；缩写放入 aliases。
+4. 每个实体必须返回 entity_type、evidence 和 confidence。
+5. 每条关系必须有明确方向、具体学科含义、主切块原文证据和 confidence。
+6. 关系类型：
+   - PREREQUISITE：源实体是学习或理解目标实体的必要基础。
+   - NEXT：目标实体是源实体的直接后续过程或扩展。
+   - CONTAINS：源实体由目标组件组成，或覆盖目标子概念。
+   - CONTRAST：两个实体存在明确的对比维度。
+   - RELATED：仅当原文明示关联且无法归入以上类型时使用。
+7. 普通教材禁止生成 EXAMINED_IN；仅真题语境允许生成。
+8. 不要因为两个实体同时出现就创建 RELATED，不要编造隐含联系。
 
 请严格按照以下JSON格式返回，不要包含markdown代码块标记：
 {{
   "knowledge_points": [
-    {{"name": "知识点名称", "aliases": ["缩写或别名"], "description": "知识点描述", "difficulty": 3, "evidence": "原文依据", "confidence": 0.85}}
+    {{"name": "知识点名称", "aliases": ["缩写或别名"], "entity_type": "概念或组件", "description": "知识点描述", "difficulty": 3, "evidence": "主切块原文依据", "confidence": 0.85}}
   ],
   "relations": [
-    {{"source": "源知识点名称", "target": "目标知识点名称", "type": "RELATED", "description": "关系描述"}}
+    {{"source": "源知识点名称", "target": "目标知识点名称", "type": "CONTAINS", "description": "具体关系描述", "evidence": "主切块原文依据", "confidence": 0.85}}
   ]
 }}"""
 
@@ -312,15 +315,16 @@ def _infer_global_relationships(kps: list, doc_title: str, subject_name: str) ->
 请分析以上知识点之间的逻辑关系。注意：知识点来自文档的不同部分，有些关联可能是隐含的、跨章节的。
 要求：
 1. 仔细分析每对知识点之间的可能关系
-2. 关系类型：PREREQUISITE（前置）、NEXT（后继）、RELATED（关联）、CONTAINS（包含）、CONTRAST（对比）、EXAMINED_IN（考点）
+2. 关系类型：PREREQUISITE（必要基础）、NEXT（直接后续）、RELATED（原文明示关联）、CONTAINS（组成或包含）、CONTRAST（明确对比）
 3. 只保留有明确语义依据的关系；没有可靠联系时不要为了数量强行添加
 4. 只返回确实存在的关系，不要编造不存在的关联
 5. 关系描述应简洁说明两个知识点之间的具体联系（10-40字）
+6. 每条关系必须返回 evidence 和 confidence；无法给出具体依据时不要输出
 
 请严格按照以下JSON格式返回：
 {{
   "relations": [
-    {{"source": "知识点A名称", "target": "知识点B名称", "type": "PREREQUISITE", "description": "A是学习B的基础"}}
+    {{"source": "知识点A名称", "target": "知识点B名称", "type": "PREREQUISITE", "description": "A是学习B的基础", "evidence": "语义依据", "confidence": 0.85}}
   ]
 }}"""
 
@@ -446,7 +450,7 @@ def _store_knowledge_points(db, kps: list, subject_id: int, document_id: int = N
     return name_to_id
 
 
-def _store_relations(db, rels: list, name_to_id: dict) -> int:
+def _store_relations(db, rels: list, name_to_id: dict, document_id: int, kg_settings: dict) -> int:
     """Store relations in MySQL and Neo4j."""
     count = 0
     for rel in rels:
@@ -461,6 +465,12 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
         if rel_type not in VALID_RELATION_TYPES:
             continue
         rel_desc = rel.get("description", "")
+        confidence = _safe_confidence(rel.get("confidence"))
+        if confidence < kg_settings["kg.relation_candidate_threshold"]:
+            continue
+        if confidence < kg_settings["kg.relation_auto_threshold"]:
+            _store_relation_candidate(db, src_id, tgt_id, rel, document_id)
+            continue
 
         existing_rel = (
             db.query(KnowledgeRelation)
@@ -472,6 +482,7 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
             .first()
         )
         if existing_rel:
+            _store_relation_evidence(db, existing_rel.id, document_id, rel)
             try:
                 neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
             except Exception as exc:
@@ -484,11 +495,12 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
             relation_type=rel_type,
             description=rel_desc,
             origin="auto",
-            confidence=_safe_confidence(rel.get("confidence")),
+            confidence=confidence,
             review_status="pending",
         )
         db.add(relation)
         db.commit()
+        _store_relation_evidence(db, relation.id, document_id, rel)
         try:
             neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
         except Exception as exc:
@@ -498,7 +510,7 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
     return count
 
 
-def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int) -> int:
+def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int, document_id: int, kg_settings: dict) -> int:
     """
     Link newly extracted entities to existing knowledge graph nodes
     in the same subject using LLM-based relationship discovery.
@@ -552,14 +564,15 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
 
 要求：
 1. 只找出确实存在语义关联的知识点对
-2. 关系类型：PREREQUISITE（前置）、NEXT（后继）、RELATED（关联）、CONTAINS（包含）、CONTRAST（对比）、EXAMINED_IN（考点）
+2. 关系类型：PREREQUISITE（必要基础）、NEXT（直接后续）、RELATED（原文明示关联）、CONTAINS（组成或包含）、CONTRAST（明确对比）
 3. 关系描述应简洁说明具体联系（10-30字）
 4. 知识点名称必须和上面列出的完全一致（一字不差）
+5. 每条关系必须返回 evidence 和 confidence；无法说明具体学科含义时不要输出
 
 请按JSON格式返回：
 {{
   "relations": [
-    {{"source": "已有知识点名称（必须是已有列表中的）", "target": "新知识点名称（必须是新列表中的）", "type": "RELATED", "description": "关系描述"}}
+    {{"source": "已有知识点名称（必须是已有列表中的）", "target": "新知识点名称（必须是新列表中的）", "type": "RELATED", "description": "关系描述", "evidence": "语义依据", "confidence": 0.85}}
   ]
 }}"""
 
@@ -599,6 +612,12 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
         if rel_type not in VALID_RELATION_TYPES:
             continue
         rel_desc = rel.get("description", "")
+        confidence = _safe_confidence(rel.get("confidence"))
+        if confidence < kg_settings["kg.relation_candidate_threshold"]:
+            continue
+        if confidence < kg_settings["kg.relation_auto_threshold"]:
+            _store_relation_candidate(db, src_id, tgt_id, rel, document_id)
+            continue
 
         existing_rel = (
             db.query(KnowledgeRelation)
@@ -610,6 +629,7 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
             .first()
         )
         if existing_rel:
+            _store_relation_evidence(db, existing_rel.id, document_id, rel)
             try:
                 neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
             except Exception as exc:
@@ -622,11 +642,12 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
             relation_type=rel_type,
             description=rel_desc,
             origin="auto",
-            confidence=_safe_confidence(rel.get("confidence")),
+            confidence=confidence,
             review_status="pending",
         )
         db.add(relation)
         db.commit()
+        _store_relation_evidence(db, relation.id, document_id, rel)
         try:
             neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
         except Exception as exc:
@@ -678,6 +699,50 @@ def _store_source(db, point_id: int, document_id: int, kp: dict, canonical_name:
     db.commit()
 
 
+def _store_relation_evidence(db, relation_id: int, document_id: int, rel: dict):
+    db.add(KnowledgeRelationEvidence(
+        relation_id=relation_id,
+        document_id=document_id,
+        chunk_id=rel.get("_chunk_id"),
+        source_name=rel.get("source", "")[:100],
+        target_name=rel.get("target", "")[:100],
+        relation_type=rel.get("type", "RELATED")[:30],
+        evidence_text=(rel.get("evidence") or rel.get("description") or "")[:1000],
+        confidence=_safe_confidence(rel.get("confidence")),
+        prompt_version=PROMPT_VERSION,
+    ))
+    db.commit()
+
+
+def _store_relation_candidate(db, source_id: int, target_id: int, rel: dict, document_id: int):
+    rel_type = rel.get("type", "RELATED").strip().upper()
+    existing = db.query(KnowledgeRelationCandidate).filter(
+        KnowledgeRelationCandidate.source_node_id == source_id,
+        KnowledgeRelationCandidate.target_node_id == target_id,
+        KnowledgeRelationCandidate.relation_type == rel_type,
+        KnowledgeRelationCandidate.status == "pending",
+    ).first()
+    if existing:
+        if _safe_confidence(rel.get("confidence")) > float(existing.confidence):
+            existing.description = rel.get("description", "")
+            existing.evidence_text = rel.get("evidence", "")
+            existing.confidence = _safe_confidence(rel.get("confidence"))
+        db.commit()
+        return
+    db.add(KnowledgeRelationCandidate(
+        source_node_id=source_id,
+        target_node_id=target_id,
+        relation_type=rel_type,
+        description=rel.get("description", ""),
+        evidence_text=rel.get("evidence", ""),
+        confidence=_safe_confidence(rel.get("confidence")),
+        document_id=document_id,
+        chunk_id=rel.get("_chunk_id"),
+        prompt_version=PROMPT_VERSION,
+    ))
+    db.commit()
+
+
 def _record_sync_failure(db, operation: str, entity_type: str, entity_id: int, payload: dict, error: Exception):
     db.add(KgSyncFailure(
         operation=operation,
@@ -715,3 +780,6 @@ def _update_rebuild_status(db, rebuild_id: int):
         rebuild.status = "partial_failed" if rebuild.failed_documents else "success"
         rebuild.finished_at = datetime.now()
     db.commit()
+    if rebuild.status in {"success", "partial_failed", "failed"}:
+        from app.common.schema_migrations import enqueue_auto_rebuild
+        enqueue_auto_rebuild()

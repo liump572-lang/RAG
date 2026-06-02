@@ -9,6 +9,14 @@ class SettingsUpdate(BaseModel):
     api_key: Optional[str] = None
 
 
+class KgExtractionSettings(BaseModel):
+    chunk_min_chars: int = Field(default=120, ge=20, le=2000)
+    chunk_size: int = Field(default=512, ge=100, le=5000)
+    chunk_overlap: int = Field(default=128, ge=0, le=4999)
+    relation_candidate_threshold: float = Field(default=0.2, ge=0, le=1)
+    relation_auto_threshold: float = Field(default=0.8, ge=0, le=1)
+
+
 class SystemConfigCreate(BaseModel):
     config_key: str = Field(..., max_length=100)
     config_value: str

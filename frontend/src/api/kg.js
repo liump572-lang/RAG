@@ -51,3 +51,15 @@ export function getRebuildStatus() {
 export function retryFailedRebuildDocuments() {
   return request.post('/kg/rebuild/retry-failed')
 }
+
+export function getRelationCandidates(params) {
+  return request.get('/kg/relation-candidates', { params })
+}
+
+export function approveRelationCandidate(id) {
+  return request.post(`/kg/relation-candidates/${id}/approve`)
+}
+
+export function rejectRelationCandidate(id) {
+  return request.post(`/kg/relation-candidates/${id}/reject`)
+}

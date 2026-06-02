@@ -10,6 +10,7 @@ from app.database import get_db
 from app.middleware.auth import get_current_user
 from app.models import SystemConfig, User
 from app.modules.system.schemas import (
+    KgExtractionSettings,
     SettingsUpdate,
     SystemConfigCreate,
     SystemConfigResponse,
@@ -25,6 +26,66 @@ AVAILABLE_MODELS = [
     {"value": "deepseek-chat", "label": "DeepSeek Chat（兼容旧配置）", "description": "旧别名，将于 2026-07-24 弃用"},
     {"value": "deepseek-reasoner", "label": "DeepSeek Reasoner（兼容旧配置）", "description": "旧别名，将于 2026-07-24 弃用"},
 ]
+
+
+@router.get("/kg-extraction-settings")
+def get_kg_extraction_settings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    from app.common.kg_settings import get_kg_settings
+    values = get_kg_settings(db)
+    return success_response(data={
+        "chunk_min_chars": values["chunk.min_chars"],
+        "chunk_size": values["chunk.size"],
+        "chunk_overlap": values["chunk.overlap"],
+        "relation_candidate_threshold": values["kg.relation_candidate_threshold"],
+        "relation_auto_threshold": values["kg.relation_auto_threshold"],
+    })
+
+
+@router.put("/kg-extraction-settings")
+def update_kg_extraction_settings(
+    body: KgExtractionSettings,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    from app.common.kg_settings import validate_kg_settings
+    try:
+        values = validate_kg_settings({
+            "chunk.min_chars": body.chunk_min_chars,
+            "chunk.size": body.chunk_size,
+            "chunk.overlap": body.chunk_overlap,
+            "kg.relation_candidate_threshold": body.relation_candidate_threshold,
+            "kg.relation_auto_threshold": body.relation_auto_threshold,
+        })
+    except ValueError as exc:
+        return error_response(400, str(exc))
+    descriptions = {
+        "chunk.min_chars": "文档最小切块大小",
+        "chunk.size": "文档目标切块大小",
+        "chunk.overlap": "文档切块重叠量",
+        "kg.relation_candidate_threshold": "关系候选保留阈值",
+        "kg.relation_auto_threshold": "关系自动入图阈值",
+    }
+    for key, value in values.items():
+        row = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
+        if row:
+            row.config_value = str(value)
+            row.updated_by = current_user.id
+        else:
+            db.add(SystemConfig(
+                config_key=key,
+                config_value=str(value),
+                description=descriptions[key],
+                updated_by=current_user.id,
+            ))
+    db.commit()
+    return success_response(message="图谱抽取设置已保存")
 
 
 @router.get("/models")
@@ -122,7 +183,10 @@ def create_config(
     existing = SystemConfigService.get_by_key(db, body.config_key)
     if existing:
         return error_response(400, "配置键已存在")
-    cfg = SystemConfigService.create(db, body, current_user.id)
+    try:
+        cfg = SystemConfigService.create(db, body, current_user.id)
+    except ValueError as exc:
+        return error_response(400, str(exc))
     return success_response(data=SystemConfigResponse.model_validate(cfg).model_dump())
 
 
@@ -135,7 +199,10 @@ def update_config(
 ):
     if current_user.role != "admin":
         return error_response(403, "无权限")
-    cfg = SystemConfigService.update(db, config_id, body, current_user.id)
+    try:
+        cfg = SystemConfigService.update(db, config_id, body, current_user.id)
+    except ValueError as exc:
+        return error_response(400, str(exc))
     if not cfg:
         return error_response(404, "配置不存在")
     return success_response(data=SystemConfigResponse.model_validate(cfg).model_dump())

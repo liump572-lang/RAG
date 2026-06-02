@@ -267,6 +267,41 @@ class KnowledgeRelation(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class KnowledgeRelationEvidence(Base):
+    __tablename__ = "knowledge_relation_evidence"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    relation_id = Column(BIGINT)
+    document_id = Column(BIGINT, nullable=False)
+    chunk_id = Column(BIGINT)
+    source_name = Column(String(100), nullable=False)
+    target_name = Column(String(100), nullable=False)
+    relation_type = Column(String(30), nullable=False)
+    evidence_text = Column(Text)
+    confidence = Column(DECIMAL(4, 3), nullable=False, default=0.800)
+    prompt_version = Column(String(50), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class KnowledgeRelationCandidate(Base):
+    __tablename__ = "knowledge_relation_candidates"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    source_node_id = Column(BIGINT, nullable=False)
+    target_node_id = Column(BIGINT, nullable=False)
+    relation_type = Column(String(30), nullable=False)
+    description = Column(String(255))
+    evidence_text = Column(Text)
+    confidence = Column(DECIMAL(4, 3), nullable=False, default=0.500)
+    document_id = Column(BIGINT)
+    chunk_id = Column(BIGINT)
+    prompt_version = Column(String(50), nullable=False)
+    status = Column(SAEnum("pending", "approved", "rejected"), nullable=False, default="pending")
+    reviewed_by = Column(BIGINT)
+    reviewed_at = Column(DateTime)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class KnowledgePointSource(Base):
     __tablename__ = "knowledge_point_sources"
 
