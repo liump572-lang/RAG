@@ -102,6 +102,7 @@ const conversationPage = ref(1)
 const conversationTotal = ref(0)
 const loadingConversations = ref(false)
 const loadingMessages = ref(false)
+const messageRequestId = ref(0)
 const messages = ref([])
 const question = ref('')
 const streaming = ref(false)
@@ -125,8 +126,10 @@ const { refresh: refreshConversations } = useAutoRefresh(fetchConversations, 100
 
 async function refreshActiveMessages() {
   if (activeConvId.value && !streaming.value && !sendingMessage.value) {
-    const res = await getMessages(activeConvId.value)
-    if (res.code === 200) {
+    const conversationId = activeConvId.value
+    const requestId = messageRequestId.value
+    const res = await getMessages(conversationId)
+    if (res.code === 200 && requestId === messageRequestId.value && activeConvId.value === conversationId) {
       const serverMsgs = res.data.messages || res.data
       if (serverMsgs.length !== messages.value.length) {
         messages.value = serverMsgs
@@ -199,24 +202,27 @@ function handleConversationScroll(event) {
 }
 
 async function switchConversation(id) {
-  if (loadingMessages.value || id === activeConvId.value) return
+  if (id === activeConvId.value && messages.value.length) return
+  const requestId = ++messageRequestId.value
   activeConvId.value = id
   const conv = conversations.value.find(c => c.id === id)
   activeConvSubjectId.value = conv?.subject_id || null
   loadingMessages.value = true
   try {
     const res = await getMessages(id)
-    if (res.code === 200 && activeConvId.value === id) {
+    if (res.code === 200 && requestId === messageRequestId.value && activeConvId.value === id) {
       messages.value = res.data.messages || res.data
       scheduleMermaid()
     }
   } finally {
-    loadingMessages.value = false
+    if (requestId === messageRequestId.value) loadingMessages.value = false
   }
   scrollToBottom()
 }
 
 async function newConversation() {
+  messageRequestId.value += 1
+  loadingMessages.value = false
   activeConvId.value = null
   activeConvSubjectId.value = null
   messages.value = []
@@ -392,8 +398,9 @@ async function refreshAfterAnswer(convId) {
   // Refresh conversation list and messages from server to get proper IDs/metadata
   await fetchConversations()
   if (convId) {
+    const requestId = ++messageRequestId.value
     const res = await getMessages(convId)
-    if (res.code === 200) {
+    if (res.code === 200 && requestId === messageRequestId.value && activeConvId.value === convId) {
       messages.value = res.data.messages || res.data
     }
   }
