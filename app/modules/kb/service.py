@@ -134,6 +134,22 @@ class KbService:
         if not doc:
             raise ValueError("Document not found")
 
+        from app.models import KgExtractionBatch, KgExtractionRun
+        doc.parse_revision = (doc.parse_revision or 0) + 1
+        active_run_ids = [
+            row.id for row in db.query(KgExtractionRun.id).filter(
+                KgExtractionRun.document_id == document_id,
+                KgExtractionRun.status.in_(("queued", "running")),
+            ).all()
+        ]
+        if active_run_ids:
+            db.query(KgExtractionBatch).filter(
+                KgExtractionBatch.run_id.in_(active_run_ids),
+                KgExtractionBatch.status.in_(("queued", "running")),
+            ).update({"status": "stale"}, synchronize_session=False)
+            db.query(KgExtractionRun).filter(
+                KgExtractionRun.id.in_(active_run_ids)
+            ).update({"status": "canceled"}, synchronize_session=False)
         db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).delete()
         doc.parse_status = "pending"
         doc.error_msg = None
@@ -229,8 +245,8 @@ class KbService:
             doc.parse_status = "success"
             db.commit()
 
-            from app.tasks.kg_extract import extract_knowledge_task
-            extract_knowledge_task.delay(document_id)
+            from app.tasks.kg_extract import queue_document_extraction_task
+            queue_document_extraction_task.delay(document_id)
 
             return {"status": "success", "chunk_count": len(chunks), "chunk_size": chunk_size}
 

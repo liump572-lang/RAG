@@ -12,7 +12,7 @@ from app.common.llm_client import chat
 from app.database import SessionLocal
 from app.config import settings
 from app.models import (
-    Document, DocumentChunk, KgExtractionRun, KgRebuild, KgSyncFailure,
+    Document, DocumentChunk, KgExtractionBatch, KgExtractionRun, KgRebuild, KgSyncFailure,
     KnowledgePoint, KnowledgePointSource, KnowledgeRelation,
     KnowledgeRelationCandidate, KnowledgeRelationEvidence, Subject,
 )
@@ -25,6 +25,225 @@ PROMPT_VERSION = "kg-v3-physical-semantic"
 VALID_RELATION_TYPES = {
     "PREREQUISITE", "NEXT", "RELATED", "CONTAINS", "CONTRAST", "EXAMINED_IN",
 }
+
+
+@celery_app.task(name="kg_task.queue_document_extraction")
+def queue_document_extraction_task(document_id: int, run_id: int = None):
+    """Create resumable extraction batches for one parsed document."""
+    db = SessionLocal()
+    try:
+        doc = db.query(Document).filter(Document.id == document_id).first()
+        if not doc or doc.parse_status != "success":
+            return {"status": "skipped", "reason": "document not parsed successfully"}
+        if not run_id:
+            from app.common.schema_migrations import KG_REBUILD_VERSION
+            existing_run = db.query(KgExtractionRun).filter(
+                KgExtractionRun.document_id == document_id,
+                KgExtractionRun.version == KG_REBUILD_VERSION,
+                KgExtractionRun.status.in_(("queued", "running")),
+            ).order_by(KgExtractionRun.id.desc()).first()
+            if existing_run:
+                return {"status": "skipped", "reason": "active run already exists", "run_id": existing_run.id}
+            run = KgExtractionRun(document_id=document_id, version=KG_REBUILD_VERSION, status="queued")
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+        else:
+            run = db.query(KgExtractionRun).filter(KgExtractionRun.id == run_id).first()
+        if not run or run.status == "canceled":
+            return {"status": "skipped", "reason": "run canceled"}
+
+        from app.common.kg_settings import get_kg_settings
+        batch_chunks = get_kg_settings(db)["kg.batch_chunks"]
+        total_chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).count()
+        if not total_chunks:
+            run.status = "failed"
+            run.error_msg = "no chunks"
+            run.finished_at = datetime.now()
+            db.commit()
+            _update_rebuild_status(db, run.rebuild_id)
+            return {"status": "skipped", "reason": "no chunks"}
+
+        run.status = "running"
+        run.model = settings.llm_model
+        run.started_at = run.started_at or datetime.now()
+        run.batch_count = (total_chunks + batch_chunks - 1) // batch_chunks
+        db.commit()
+
+        existing = db.query(KgExtractionBatch).filter(KgExtractionBatch.run_id == run.id).count()
+        if not existing:
+            for start in range(0, total_chunks, batch_chunks):
+                db.add(KgExtractionBatch(
+                    run_id=run.id,
+                    document_id=document_id,
+                    parse_revision=doc.parse_revision or 0,
+                    start_index=start,
+                    end_index=min(total_chunks, start + batch_chunks),
+                ))
+            db.commit()
+
+        _dispatch_parallel_batches(db)
+        return {"status": "queued", "batches": run.batch_count}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_task.extract_knowledge_batch", bind=True, default_retry_delay=30)
+def extract_knowledge_batch_task(self, batch_id: int):
+    """Extract a bounded chunk range so failures and retries stay local."""
+    db = SessionLocal()
+    try:
+        batch = db.query(KgExtractionBatch).filter(KgExtractionBatch.id == batch_id).first()
+        if not batch or batch.status in {"success", "stale", "canceled"}:
+            return {"status": "skipped"}
+        run = db.query(KgExtractionRun).filter(KgExtractionRun.id == batch.run_id).first()
+        doc = db.query(Document).filter(Document.id == batch.document_id).first()
+        if not run or run.status == "canceled" or not doc or (doc.parse_revision or 0) != batch.parse_revision:
+            batch.status = "stale"
+            batch.finished_at = datetime.now()
+            db.commit()
+            return {"status": "stale"}
+
+        batch.status = "running"
+        batch.started_at = batch.started_at or datetime.now()
+        db.commit()
+        subject = db.query(Subject).filter(Subject.id == doc.subject_id).first()
+        subject_name = subject.name if subject else "未知"
+        chunks = db.query(DocumentChunk).filter(
+            DocumentChunk.document_id == doc.id
+        ).order_by(DocumentChunk.chunk_index).all()
+        all_kps, all_rels = [], []
+        for index in range(batch.start_index, min(batch.end_index, len(chunks))):
+            if (doc.parse_revision or 0) != batch.parse_revision:
+                batch.status = "stale"
+                batch.finished_at = datetime.now()
+                db.commit()
+                return {"status": "stale"}
+            data = _parse_json_response(_call_extract_entities(
+                _build_extraction_text(doc.title, chunks, index), subject_name, doc.doc_type
+            ))
+            if not data:
+                continue
+            for kp in data.get("knowledge_points", []):
+                kp["_batch"] = f"{index + 1}-{index + 1}"
+                kp["_chunk_id"] = chunks[index].id
+            for rel in data.get("relations", []):
+                rel["_chunk_id"] = chunks[index].id
+            if doc.doc_type != "exam":
+                data["relations"] = [rel for rel in data.get("relations", []) if rel.get("type") != "EXAMINED_IN"]
+            all_kps.extend(data.get("knowledge_points", []))
+            all_rels.extend(data.get("relations", []))
+
+        doc = db.query(Document).filter(Document.id == batch.document_id).first()
+        if not doc or (doc.parse_revision or 0) != batch.parse_revision:
+            batch.status = "stale"
+        else:
+            batch.status = "success"
+            batch.result_json = {"knowledge_points": all_kps, "relations": all_rels}
+            batch.entity_count = len(all_kps)
+            batch.relation_count = len(all_rels)
+        batch.finished_at = datetime.now()
+        db.commit()
+        _refresh_parallel_run(db, batch.run_id)
+        _dispatch_parallel_batches(db)
+        return {"status": batch.status, "entities": len(all_kps), "relations": len(all_rels)}
+    except Exception as exc:
+        db.rollback()
+        batch = db.query(KgExtractionBatch).filter(KgExtractionBatch.id == batch_id).first()
+        if not batch:
+            return {"status": "failed", "reason": str(exc)}
+        from app.common.kg_settings import get_kg_settings
+        retry_limit = get_kg_settings(db)["kg.batch_retry_limit"]
+        batch.retry_count += 1
+        batch.error_msg = str(exc)[:1000]
+        batch.status = "dispatched" if batch.retry_count <= retry_limit else "failed"
+        db.commit()
+        if batch.status == "dispatched":
+            raise self.retry(exc=exc)
+        _refresh_parallel_run(db, batch.run_id)
+        _dispatch_parallel_batches(db)
+        return {"status": "failed", "reason": str(exc)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="kg_task.finalize_document_extraction")
+def finalize_document_extraction_task(run_id: int):
+    """Merge successful batch payloads once and write the resulting graph."""
+    db = SessionLocal()
+    try:
+        run = db.query(KgExtractionRun).filter(KgExtractionRun.id == run_id).first()
+        if not run or run.status in {"success", "failed", "canceled"}:
+            return {"status": "skipped"}
+        doc = db.query(Document).filter(Document.id == run.document_id).first()
+        batches = db.query(KgExtractionBatch).filter(KgExtractionBatch.run_id == run_id).all()
+        if any(batch.status == "failed" for batch in batches):
+            run.status = "failed"
+            run.error_msg = "one or more extraction batches failed"
+            run.finished_at = datetime.now()
+            db.commit()
+            _update_rebuild_status(db, run.rebuild_id)
+            return {"status": "failed"}
+        if any(batch.status != "success" for batch in batches):
+            return {"status": "waiting"}
+
+        subject = db.query(Subject).filter(Subject.id == doc.subject_id).first()
+        subject_name = subject.name if subject else "未知"
+        all_kps, all_rels = [], []
+        for batch in batches:
+            payload = batch.result_json or {}
+            all_kps.extend(payload.get("knowledge_points", []))
+            all_rels.extend(payload.get("relations", []))
+        merged_kps, merged_rels = _merge_entities(all_kps, all_rels, doc.title, subject_name)
+        if len(merged_kps) >= 2:
+            merged_rels.extend(_infer_global_relationships(merged_kps, doc.title, subject_name))
+            merged_rels = _dedup_relations(merged_rels)
+        from app.common.kg_settings import get_kg_settings
+        kg_settings = get_kg_settings(db)
+        name_to_id = _store_knowledge_points(db, merged_kps, doc.subject_id, doc.id)
+        rel_count = _store_relations(db, merged_rels, name_to_id, doc.id, kg_settings)
+        rel_count += _link_to_existing_graph(db, merged_kps, name_to_id, doc.subject_id, doc.id, kg_settings)
+        _finish_run(db, run, {
+            "knowledge_points_created": len(name_to_id),
+            "relations_created": rel_count,
+        })
+        return {"status": "success", "entities": len(name_to_id), "relations": rel_count}
+    finally:
+        db.close()
+
+
+def _refresh_parallel_run(db, run_id: int):
+    run = db.query(KgExtractionRun).filter(KgExtractionRun.id == run_id).first()
+    if not run or run.status == "canceled":
+        return
+    batches = db.query(KgExtractionBatch).filter(KgExtractionBatch.run_id == run_id).all()
+    run.processed_batches = sum(batch.status in {"success", "failed", "stale"} for batch in batches)
+    db.commit()
+    if batches and all(batch.status in {"success", "failed", "stale", "canceled"} for batch in batches):
+        finalize_document_extraction_task.delay(run_id)
+
+
+def _dispatch_parallel_batches(db):
+    """Keep only the configured number of graph extraction batches in flight."""
+    from app.common.kg_settings import get_kg_settings
+    limit = get_kg_settings(db)["kg.max_parallel_batches"]
+    active = db.query(KgExtractionBatch).filter(
+        KgExtractionBatch.status.in_(("dispatched", "running")),
+    ).count()
+    slots = max(0, limit - active)
+    if not slots:
+        return
+    batches = db.query(KgExtractionBatch).join(
+        KgExtractionRun, KgExtractionRun.id == KgExtractionBatch.run_id,
+    ).filter(
+        KgExtractionBatch.status == "queued",
+        KgExtractionRun.status == "running",
+    ).order_by(KgExtractionBatch.id).limit(slots).all()
+    for batch in batches:
+        batch.status = "dispatched"
+    db.commit()
+    for batch in batches:
+        extract_knowledge_batch_task.delay(batch.id)
 
 
 @celery_app.task(name="kg_task.extract_knowledge", bind=True, max_retries=2, default_retry_delay=60)
@@ -250,9 +469,6 @@ def _merge_entities(all_kps: list, all_rels: list, doc_title: str, subject_name:
     for rel in all_rels:
         rel["source"] = canonical_names.get(rel.get("source", "").strip(), rel.get("source", "").strip())
         rel["target"] = canonical_names.get(rel.get("target", "").strip(), rel.get("target", "").strip())
-
-    if len(unique_kps) > 40:
-        unique_kps, all_rels = _llm_merge_entities(unique_kps, all_rels, doc_title, subject_name)
 
     unique_rels = _dedup_relations(all_rels)
     return unique_kps, unique_rels
@@ -528,7 +744,7 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
             KnowledgePoint.subject_id == subject_id,
             ~KnowledgePoint.id.in_(new_ids),
         )
-        .limit(120)
+        .limit(kg_settings["kg.cross_relation_top_k"])
         .all()
     )
 
@@ -551,7 +767,7 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
     )
     existing_text = "\n".join(
         f"- {kp.name}：{kp.description or ''}"
-        for kp in existing_kps[:80]
+        for kp in existing_kps
     )
 
     prompt = f"""你是一个知识图谱构建专家。请找出新提取的知识点和已有知识点之间的关联关系。

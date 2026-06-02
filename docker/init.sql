@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS documents (
     parse_status ENUM('pending', 'parsing', 'success', 'failed') DEFAULT 'pending' COMMENT '解析状态',
     error_msg TEXT COMMENT '解析失败原因',
     chunk_count INT DEFAULT 0 COMMENT '分片数',
+    parse_revision INT NOT NULL DEFAULT 0 COMMENT '解析版本号',
     year INT COMMENT '真题年份',
     question_type VARCHAR(50) COMMENT '真题题型',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -244,7 +245,11 @@ INSERT IGNORE INTO system_configs (config_key, config_value, description) VALUES
     ('chunk.overlap', '128', '分块重叠量'),
     ('chunk.min_chars', '120', '文档最小切块大小'),
     ('kg.relation_candidate_threshold', '0.2', '关系候选保留阈值'),
-    ('kg.relation_auto_threshold', '0.8', '关系自动入图阈值');
+    ('kg.relation_auto_threshold', '0.8', '关系自动入图阈值'),
+    ('kg.batch_chunks', '20', '每个并行抽取分段包含的切块数'),
+    ('kg.max_parallel_batches', '8', '图谱抽取最大并行分段数'),
+    ('kg.batch_retry_limit', '2', '图谱抽取分段失败重试次数'),
+    ('kg.cross_relation_top_k', '30', '跨文档关系候选召回数量');
 
 -- 消息通知表
 CREATE TABLE IF NOT EXISTS notifications (
@@ -381,7 +386,7 @@ CREATE TABLE IF NOT EXISTS kg_extraction_runs (
     rebuild_id BIGINT,
     document_id BIGINT NOT NULL,
     version VARCHAR(50) NOT NULL,
-    status ENUM('queued', 'running', 'success', 'failed') NOT NULL DEFAULT 'queued',
+    status ENUM('queued', 'running', 'success', 'failed', 'canceled') NOT NULL DEFAULT 'queued',
     model VARCHAR(100),
     batch_count INT NOT NULL DEFAULT 0,
     processed_batches INT NOT NULL DEFAULT 0,
@@ -394,6 +399,27 @@ CREATE TABLE IF NOT EXISTS kg_extraction_runs (
     INDEX idx_kger_rebuild (rebuild_id),
     INDEX idx_kger_document (document_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识图谱文档抽取运行记录';
+
+CREATE TABLE IF NOT EXISTS kg_extraction_batches (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    run_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    parse_revision INT NOT NULL DEFAULT 0,
+    start_index INT NOT NULL,
+    end_index INT NOT NULL,
+    status ENUM('queued', 'dispatched', 'running', 'success', 'failed', 'stale', 'canceled') NOT NULL DEFAULT 'queued',
+    retry_count INT NOT NULL DEFAULT 0,
+    entity_count INT NOT NULL DEFAULT 0,
+    relation_count INT NOT NULL DEFAULT 0,
+    result_json JSON,
+    error_msg TEXT,
+    started_at DATETIME,
+    finished_at DATETIME,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_kgeb_run (run_id),
+    INDEX idx_kgeb_document (document_id),
+    INDEX idx_kgeb_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识图谱并行抽取分段';
 
 CREATE TABLE IF NOT EXISTS kg_sync_failures (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

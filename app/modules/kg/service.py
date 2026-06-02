@@ -18,7 +18,7 @@ from app.common.graph_store import (
 from app.common.llm_client import chat
 from app.config import settings
 from app.models import (
-    Document, KgExtractionRun, KgRebuild, KgSyncFailure, KnowledgePoint,
+    Document, KgExtractionBatch, KgExtractionRun, KgRebuild, KgSyncFailure, KnowledgePoint,
     KnowledgeRelation, KnowledgeRelationCandidate, KnowledgeRelationEvidence, Subject,
 )
 
@@ -191,6 +191,39 @@ class KgService:
             .limit(10)
             .all()
         )
+        runs = db.query(KgExtractionRun).filter(
+            KgExtractionRun.rebuild_id == rebuild.id,
+            KgExtractionRun.status != "canceled",
+        ).all()
+        run_ids = [run.id for run in runs]
+        batches = db.query(KgExtractionBatch).filter(KgExtractionBatch.run_id.in_(run_ids)).all() if run_ids else []
+        batch_map = {}
+        for batch in batches:
+            batch_map.setdefault(batch.run_id, []).append(batch)
+        total_chunks = sum(max(0, batch.end_index - batch.start_index) for batch in batches)
+        processed_chunks = sum(
+            max(0, batch.end_index - batch.start_index)
+            for batch in batches if batch.status in {"success", "failed", "stale"}
+        )
+        elapsed_seconds = max(1, int((datetime.now() - rebuild.started_at).total_seconds())) if rebuild.started_at else 0
+        eta_seconds = int((total_chunks - processed_chunks) / (processed_chunks / elapsed_seconds)) if processed_chunks else None
+        documents = []
+        for run in runs:
+            run_batches = batch_map.get(run.id, [])
+            run_total = sum(max(0, batch.end_index - batch.start_index) for batch in run_batches)
+            run_processed = sum(
+                max(0, batch.end_index - batch.start_index)
+                for batch in run_batches if batch.status in {"success", "failed", "stale"}
+            )
+            documents.append({
+                "document_id": run.document_id,
+                "title": db.query(Document.title).filter(Document.id == run.document_id).scalar() or "",
+                "status": run.status,
+                "processed_chunks": run_processed,
+                "total_chunks": run_total,
+                "percentage": round(run_processed * 100 / run_total) if run_total else 0,
+                "failed_batches": sum(batch.status == "failed" for batch in run_batches),
+            })
         return {
             "id": rebuild.id,
             "version": rebuild.version,
@@ -201,6 +234,12 @@ class KgService:
             "created_at": rebuild.created_at.isoformat() if rebuild.created_at else None,
             "finished_at": rebuild.finished_at.isoformat() if rebuild.finished_at else None,
             "failed_runs": [{"document_id": run.document_id, "error_msg": run.error_msg} for run in failed_runs],
+            "processed_chunks": processed_chunks,
+            "total_chunks": total_chunks,
+            "percentage": round(processed_chunks * 100 / total_chunks) if total_chunks else 0,
+            "eta_seconds": max(0, eta_seconds) if eta_seconds is not None else None,
+            "documents": documents,
+            "total_nodes": db.query(KnowledgePoint).count(),
         }
 
     @staticmethod
@@ -212,13 +251,14 @@ class KgService:
             KgExtractionRun.rebuild_id == rebuild.id,
             KgExtractionRun.status == "failed",
         ).all()
-        from app.tasks.kg_extract import extract_knowledge_task
+        from app.tasks.kg_extract import queue_document_extraction_task
         for run in runs:
             run.status = "queued"
             run.error_msg = None
             run.processed_batches = 0
+            db.query(KgExtractionBatch).filter(KgExtractionBatch.run_id == run.id).delete()
             db.commit()
-            extract_knowledge_task.delay(run.document_id, run.id)
+            queue_document_extraction_task.delay(run.document_id, run.id)
         if runs:
             rebuild.status = "running"
             rebuild.finished_at = None

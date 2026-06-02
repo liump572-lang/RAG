@@ -121,7 +121,8 @@ services:
       chromadb:
         condition: service_healthy
 
-  celery-worker:
+  celery-worker: &celery-worker
+    image: knowledge-qa-system-celery-worker
     build:
       context: ..
       dockerfile: docker/Dockerfile.celery
@@ -155,6 +156,11 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_healthy
+
+  celery-kg-worker:
+    <<: *celery-worker
+    container_name: kqa-celery-kg-worker
+    command: ["celery", "-A", "app.tasks.celery_app", "worker", "-l", "info", "-Q", "kg_queue", "--concurrency=8"]
 
   frontend:
     build:

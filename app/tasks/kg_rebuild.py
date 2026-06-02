@@ -15,17 +15,29 @@ def rebuild_all_documents_task(rebuild_id: int):
     db = SessionLocal()
     try:
         rebuild = db.query(KgRebuild).filter(KgRebuild.id == rebuild_id).first()
-        if not rebuild or rebuild.status not in {"queued", "failed"}:
+        if not rebuild:
+            return {"status": "skipped"}
+        claimed = db.query(KgRebuild).filter(
+            KgRebuild.id == rebuild_id,
+            KgRebuild.status.in_(("queued", "failed")),
+        ).update({"status": "running", "started_at": datetime.now()}, synchronize_session=False)
+        db.commit()
+        if claimed != 1:
             return {"status": "skipped"}
 
         documents = db.query(Document).filter(Document.parse_status == "success").order_by(Document.id).all()
-        rebuild.status = "running"
-        rebuild.started_at = datetime.now()
+        rebuild = db.query(KgRebuild).filter(KgRebuild.id == rebuild_id).first()
         rebuild.total_documents = len(documents)
         db.commit()
 
-        from app.tasks.kg_extract import extract_knowledge_task
+        from app.tasks.kg_extract import queue_document_extraction_task
         for document in documents:
+            existing = db.query(KgExtractionRun).filter(
+                KgExtractionRun.rebuild_id == rebuild.id,
+                KgExtractionRun.document_id == document.id,
+            ).first()
+            if existing:
+                continue
             run = KgExtractionRun(
                 rebuild_id=rebuild.id,
                 document_id=document.id,
@@ -35,7 +47,7 @@ def rebuild_all_documents_task(rebuild_id: int):
             db.add(run)
             db.commit()
             db.refresh(run)
-            extract_knowledge_task.delay(document.id, run.id)
+            queue_document_extraction_task.delay(document.id, run.id)
 
         if not documents:
             rebuild.status = "success"

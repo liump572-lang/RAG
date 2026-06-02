@@ -16,9 +16,10 @@ celery_app.conf.update(
     enable_utc=True,
     task_queues={
         "parse_queue": {"exchange": "parse_queue", "routing_key": "parse_queue"},
+        "kg_queue": {"exchange": "kg_queue", "routing_key": "kg_queue"},
     },
     task_routes={
         "kb_task.*": {"queue": "parse_queue"},
-        "kg_task.*": {"queue": "parse_queue"},
+        "kg_task.*": {"queue": "kg_queue"},
     },
 )

@@ -27,6 +27,10 @@
         <span class="rebuild-progress">
           {{ rebuildStatus.completed_documents || 0 }} / {{ rebuildStatus.total_documents || 0 }} 个文档完成
         </span>
+        <span v-if="rebuildStatus.total_chunks">
+          {{ rebuildStatus.processed_chunks || 0 }} / {{ rebuildStatus.total_chunks }} 个切块
+        </span>
+        <span v-if="rebuildStatus.eta_seconds != null">预计剩余 {{ formatEta(rebuildStatus.eta_seconds) }}</span>
         <span v-if="rebuildStatus.failed_documents" class="rebuild-failed">
           {{ rebuildStatus.failed_documents }} 个失败
         </span>
@@ -43,6 +47,15 @@
         :status="rebuildStatus.status === 'partial_failed' ? 'warning' : undefined"
         :stroke-width="6"
       />
+      <details v-if="rebuildStatus.documents?.length" class="rebuild-details">
+        <summary>查看文档级进度</summary>
+        <div v-for="doc in rebuildStatus.documents" :key="doc.document_id" class="rebuild-document">
+          <span class="rebuild-document-title">{{ doc.title || `文档 ${doc.document_id}` }}</span>
+          <span>{{ doc.processed_chunks || 0 }} / {{ doc.total_chunks || 0 }} 切块</span>
+          <span>{{ doc.percentage || 0 }}%</span>
+          <span v-if="doc.failed_batches" class="rebuild-failed">{{ doc.failed_batches }} 个失败分段</span>
+        </div>
+      </details>
     </el-card>
 
     <div class="kg-body">
@@ -51,6 +64,17 @@
           <div ref="graphRef" class="graph-canvas"></div>
           <el-empty v-if="!loading && graphData.nodes.length === 0" description="暂无图谱数据，请先导入种子数据" />
           <div class="graph-hint">滚轮缩放 · 拖拽平移 · 点击节点查看详情</div>
+          <div class="graph-pan-controls">
+            <button class="pan-button pan-up" title="向上移动画布" @click="panGraph('up')">↑</button>
+            <button class="pan-button pan-left" title="向左移动画布" @click="panGraph('left')">←</button>
+            <button class="pan-button pan-down" title="向下移动画布" @click="panGraph('down')">↓</button>
+            <button class="pan-button pan-right" title="向右移动画布" @click="panGraph('right')">→</button>
+          </div>
+          <div class="graph-zoom-controls">
+            <button class="pan-button" title="适应画布" @click="fitGraph">□</button>
+            <button class="pan-button" title="缩小画布" @click="zoomGraph(0.85)">−</button>
+            <button class="pan-button" title="放大画布" @click="zoomGraph(1.15)">+</button>
+          </div>
         </el-card>
         <div class="graph-legend">
           <div class="legend-title">关系</div>
@@ -82,7 +106,8 @@
           </div>
         </div>
         <div v-else>
-          <div class="stat-item"><span class="stat-num">{{ graphData.nodes.length }}</span><span class="stat-label">节点数</span></div>
+          <div class="stat-item"><span class="stat-num">{{ rebuildStatus.total_nodes ?? graphData.nodes.length }}</span><span class="stat-label">数据库总节点数</span></div>
+          <div class="stat-item"><span class="stat-num">{{ graphData.nodes.length }}</span><span class="stat-label">当前画布节点数</span></div>
           <div class="stat-item"><span class="stat-num">{{ graphData.edges.length }}</span><span class="stat-label">关系数</span></div>
           <div v-if="filter.keyword && highlightedNodes.size" class="stat-item" style="color:#f59e0b">
             <span class="stat-num" style="color:#f59e0b">{{ highlightedNodes.size }}</span><span class="stat-label">匹配节点</span>
@@ -231,6 +256,7 @@ const candidateSize = 20
 const candidateTotal = ref(0)
 let network = null
 let renderedGraphSignature = ''
+let clampGraphView = null
 
 const edgeTypeConfig = {
   PREREQUISITE: { color: '#f472b6', dashes: 'dashed', label: '前置条件' },
@@ -273,9 +299,18 @@ onMounted(() => {
 })
 
 const rebuildPercentage = computed(() => {
+  if (rebuildStatus.value.total_chunks) return rebuildStatus.value.percentage || 0
   const total = rebuildStatus.value.total_documents || 0
   return total ? Math.round(((rebuildStatus.value.completed_documents || 0) / total) * 100) : 0
 })
+
+function formatEta(seconds) {
+  if (seconds < 60) return `${seconds} 秒`
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.ceil((seconds % 3600) / 60)
+  return `${hours} 小时 ${minutes} 分钟`
+}
 
 const rebuildStatusLabel = computed(() => ({
   queued: '排队中',
@@ -450,6 +485,7 @@ function graphSignature() {
 function destroyNetwork() {
   if (network) network.destroy()
   network = null
+  clampGraphView = null
   renderedGraphSignature = ''
 }
 
@@ -599,7 +635,7 @@ function renderGraph(silent = false) {
       tooltipDelay: 150,
       selectConnectedEdges: true,
       multiselect: false,
-      navigationButtons: true,
+      navigationButtons: false,
       keyboard: true,
       zoomView: true,
       dragView: true,
@@ -656,7 +692,7 @@ function renderGraph(silent = false) {
       maxX: bxMax + PAD, maxY: byMax + PAD,
     }
 
-    function clampView() {
+    clampGraphView = function clampView() {
       const scale = network.getScale()
       const pos = network.getViewPosition()
       const halfW = container.clientWidth / 2 / scale
@@ -670,8 +706,8 @@ function renderGraph(silent = false) {
       if (moved) network.moveTo({ position: { x: cx, y: cy }, animation: false })
     }
 
-    network.on('dragEnd', clampView)
-    network.on('zoom', clampView)
+    network.on('dragEnd', clampGraphView)
+    network.on('zoom', clampGraphView)
   })
 
   network.on('click', (params) => {
@@ -702,6 +738,34 @@ function fitGraph() {
       animation: false,
     })
   }
+}
+
+function panGraph(direction) {
+  if (!network) return
+  const pos = network.getViewPosition()
+  const step = 120 / network.getScale()
+  const offsets = {
+    up: { x: 0, y: step },
+    down: { x: 0, y: -step },
+    left: { x: step, y: 0 },
+    right: { x: -step, y: 0 },
+  }
+  const offset = offsets[direction]
+  if (!offset) return
+  network.moveTo({
+    position: { x: pos.x + offset.x, y: pos.y + offset.y },
+    animation: { duration: 180, easingFunction: 'easeInOutQuad' },
+  })
+  window.setTimeout(() => clampGraphView?.(), 200)
+}
+
+function zoomGraph(factor) {
+  if (!network) return
+  network.moveTo({
+    scale: Math.min(2.5, Math.max(0.08, network.getScale() * factor)),
+    animation: { duration: 180, easingFunction: 'easeInOutQuad' },
+  })
+  window.setTimeout(() => clampGraphView?.(), 200)
 }
 
 async function handleSearch() {
@@ -844,6 +908,7 @@ async function handleSaveEdge() {
   border: none;
   border-radius: 10px;
 }
+
 .rebuild-status :deep(.el-card__body) { padding: 10px 16px; }
 .rebuild-summary {
   display: flex;
@@ -856,6 +921,10 @@ async function handleSaveEdge() {
 .rebuild-title { font-weight: 700; color: #334155; }
 .rebuild-progress { margin-left: auto; }
 .rebuild-failed { color: #d97706; }
+.rebuild-details { margin-top: 8px; font-size: 12px; color: #64748b; }
+.rebuild-details summary { cursor: pointer; }
+.rebuild-document { display: flex; gap: 12px; padding: 5px 0 0; }
+.rebuild-document-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .candidate-card { margin-bottom: 12px; }
 .candidate-title { display:flex; gap:8px; align-items:center; color:#334155; }
@@ -922,6 +991,50 @@ async function handleSaveEdge() {
   border-radius: 20px;
   white-space: nowrap;
   border: 1px solid rgba(203,213,225,0.3);
+}
+
+.graph-pan-controls,
+.graph-zoom-controls {
+  position: absolute;
+  z-index: 2;
+  display: grid;
+  gap: 6px;
+}
+.graph-pan-controls {
+  left: 18px;
+  bottom: 18px;
+  grid-template-columns: repeat(3, 36px);
+  grid-template-rows: repeat(2, 36px);
+}
+.graph-zoom-controls {
+  right: 18px;
+  bottom: 18px;
+  grid-template-columns: repeat(2, 36px);
+  grid-template-rows: repeat(2, 36px);
+}
+.pan-up { grid-column: 2; }
+.pan-left { grid-column: 1; grid-row: 2; }
+.pan-down { grid-column: 2; grid-row: 2; }
+.pan-right { grid-column: 3; grid-row: 2; }
+.pan-button {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 2px solid #22c55e;
+  border-radius: 50%;
+  background: rgba(240, 253, 244, 0.92);
+  color: #16a34a;
+  cursor: pointer;
+  font-size: 24px;
+  line-height: 30px;
+  transition: background-color 0.15s ease, transform 0.15s ease;
+}
+.pan-button:hover {
+  background: #dcfce7;
+  transform: scale(1.06);
+}
+.graph-zoom-controls .pan-button:first-child {
+  grid-column: 2;
 }
 
 /* ── Legend ── */
