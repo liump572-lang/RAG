@@ -19,6 +19,31 @@
       </el-form>
     </el-card>
 
+    <el-card v-if="rebuildStatus.status !== 'not_started'" class="rebuild-status">
+      <div class="rebuild-summary">
+        <span class="rebuild-title">图谱全量重建</span>
+        <el-tag :type="rebuildTagType">{{ rebuildStatusLabel }}</el-tag>
+        <span class="rebuild-progress">
+          {{ rebuildStatus.completed_documents || 0 }} / {{ rebuildStatus.total_documents || 0 }} 个文档完成
+        </span>
+        <span v-if="rebuildStatus.failed_documents" class="rebuild-failed">
+          {{ rebuildStatus.failed_documents }} 个失败
+        </span>
+        <el-button
+          v-if="rebuildStatus.failed_documents"
+          size="small"
+          type="warning"
+          :loading="retryingRebuild"
+          @click="handleRetryFailedRebuild"
+        >重试失败文档</el-button>
+      </div>
+      <el-progress
+        :percentage="rebuildPercentage"
+        :status="rebuildStatus.status === 'partial_failed' ? 'warning' : undefined"
+        :stroke-width="6"
+      />
+    </el-card>
+
     <div class="kg-body">
       <div class="graph-wrapper">
         <el-card class="graph-container" v-loading="loading">
@@ -146,11 +171,11 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, nextTick } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, nextTick } from 'vue'
 import { ElMessage, ElNotification } from 'element-plus'
 import { Network } from 'vis-network'
 import 'vis-network/styles/vis-network.css'
-import { getSubgraph, searchSubgraph, createPoint, updatePoint, deletePoint, createRelation, generateDocument } from '@/api/kg'
+import { getSubgraph, searchSubgraph, createPoint, updatePoint, deletePoint, createRelation, generateDocument, getRebuildStatus, retryFailedRebuildDocuments } from '@/api/kg'
 import { getSubjects } from '@/api/subjects'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 
@@ -163,6 +188,8 @@ const selectedNode = ref(null)
 const highlightedNodes = ref(new Set())
 const isSearchMode = ref(false)
 const nodeRelations = ref([])
+const rebuildStatus = ref({ status: 'not_started', total_documents: 0, completed_documents: 0, failed_documents: 0 })
+const retryingRebuild = ref(false)
 let network = null
 let renderedGraphSignature = ''
 
@@ -193,6 +220,7 @@ const genDocLoading = ref(false)
 const genDocForm = ref({ subject_id: null, doc_type: 'study_guide' })
 
 const { refresh: autoRefresh, stopPolling: stopAutoRefresh, startPolling: startAutoRefresh } = useAutoRefresh(() => {
+  fetchRebuildStatus()
   if (!isSearchMode.value && graphData.value.nodes.length > 0) {
     fetchGraph(true)
   }
@@ -201,8 +229,50 @@ const { refresh: autoRefresh, stopPolling: stopAutoRefresh, startPolling: startA
 onMounted(() => {
   fetchSubjects()
   fetchGraph()
+  fetchRebuildStatus()
   window.addEventListener('resize', handleResize)
 })
+
+const rebuildPercentage = computed(() => {
+  const total = rebuildStatus.value.total_documents || 0
+  return total ? Math.round(((rebuildStatus.value.completed_documents || 0) / total) * 100) : 0
+})
+
+const rebuildStatusLabel = computed(() => ({
+  queued: '排队中',
+  running: '重建中',
+  success: '已完成',
+  partial_failed: '部分失败',
+  failed: '失败',
+}[rebuildStatus.value.status] || '未开始'))
+
+const rebuildTagType = computed(() => ({
+  queued: 'info',
+  running: 'primary',
+  success: 'success',
+  partial_failed: 'warning',
+  failed: 'danger',
+}[rebuildStatus.value.status] || 'info'))
+
+async function fetchRebuildStatus() {
+  try {
+    const res = await getRebuildStatus()
+    if (res.code === 200) rebuildStatus.value = res.data
+  } catch {}
+}
+
+async function handleRetryFailedRebuild() {
+  retryingRebuild.value = true
+  try {
+    const res = await retryFailedRebuildDocuments()
+    if (res.code === 200) {
+      ElMessage.success(`已重新排队 ${res.data.queued_documents} 个文档`)
+      await fetchRebuildStatus()
+    }
+  } finally {
+    retryingRebuild.value = false
+  }
+}
 
 onActivated(() => {
   if (graphData.value.nodes.length > 0) autoRefresh()
@@ -702,6 +772,24 @@ async function handleSaveEdge() {
   border-radius: 10px;
 }
 .kg-toolbar .el-form { margin-bottom: 0; }
+
+.rebuild-status {
+  flex-shrink: 0;
+  border: none;
+  border-radius: 10px;
+}
+.rebuild-status :deep(.el-card__body) { padding: 10px 16px; }
+.rebuild-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #64748b;
+}
+.rebuild-title { font-weight: 700; color: #334155; }
+.rebuild-progress { margin-left: auto; }
+.rebuild-failed { color: #d97706; }
 
 .kg-body {
   flex: 1;

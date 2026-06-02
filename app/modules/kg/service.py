@@ -17,22 +17,36 @@ from app.common.graph_store import (
 )
 from app.common.llm_client import chat
 from app.config import settings
-from app.models import Document, KnowledgePoint, KnowledgeRelation, Subject
+from app.models import Document, KgExtractionRun, KgRebuild, KgSyncFailure, KnowledgePoint, KnowledgeRelation, Subject
+
+
+def _record_sync_failure(db: Session, operation: str, entity_type: str, entity_id: int, payload: dict, error: Exception):
+    db.add(KgSyncFailure(
+        operation=operation,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        payload=payload,
+        error_msg=str(error)[:1000],
+    ))
+    db.commit()
 
 
 class KgService:
 
     @staticmethod
     def create_point(db: Session, name: str, subject_id: int, description: str = None, difficulty: int = 3) -> KnowledgePoint:
-        point = KnowledgePoint(name=name, subject_id=subject_id, description=description, difficulty=difficulty)
+        point = KnowledgePoint(
+            name=name, subject_id=subject_id, description=description, difficulty=difficulty,
+            origin="manual", confidence=1.0, review_status="approved",
+        )
         db.add(point)
         db.commit()
         db.refresh(point)
 
         try:
             neo4j_create_node(point.id, point.name, point.subject_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "node", point.id, {"name": point.name}, exc)
 
         return point
 
@@ -52,8 +66,8 @@ class KgService:
 
         try:
             neo4j_update_node(point.id, point.name, point.description)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "node", point.id, {"name": point.name}, exc)
 
         return point
 
@@ -70,8 +84,8 @@ class KgService:
 
         try:
             neo4j_delete_node(point_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "delete", "node", point_id, {}, exc)
 
         return True
 
@@ -107,8 +121,8 @@ class KgService:
                 neo4j_create_node(source.id, source.name, source.subject_id)
                 neo4j_create_node(target.id, target.name, target.subject_id)
                 neo4j_create_relation(source_id, target_id, relation_type, description or existing.description)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_sync_failure(db, "upsert", "relation", existing.id, {}, exc)
             return existing
 
         rel = KnowledgeRelation(
@@ -116,6 +130,9 @@ class KgService:
             target_node_id=target_id,
             relation_type=relation_type,
             description=description,
+            origin="manual",
+            confidence=1.0,
+            review_status="approved",
         )
         db.add(rel)
         db.commit()
@@ -125,8 +142,8 @@ class KgService:
             neo4j_create_node(source.id, source.name, source.subject_id)
             neo4j_create_node(target.id, target.name, target.subject_id)
             neo4j_create_relation(source_id, target_id, relation_type, description)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "relation", rel.id, {}, exc)
 
         return rel
 
@@ -140,8 +157,12 @@ class KgService:
 
         try:
             neo4j_delete_relation(rel.source_node_id, rel.target_node_id, rel.relation_type)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "delete", "relation", rel.id, {
+                "source_id": rel.source_node_id,
+                "target_id": rel.target_node_id,
+                "relation_type": rel.relation_type,
+            }, exc)
 
         return True
 
@@ -154,6 +175,52 @@ class KgService:
                 KnowledgeRelation.source_node_id == KnowledgePoint.id,
             ).filter(KnowledgePoint.subject_id == subject_id)
         return query.all()
+
+    @staticmethod
+    def rebuild_status(db: Session) -> dict:
+        rebuild = db.query(KgRebuild).order_by(KgRebuild.id.desc()).first()
+        if not rebuild:
+            return {"status": "not_started", "total_documents": 0, "completed_documents": 0, "failed_documents": 0}
+        failed_runs = (
+            db.query(KgExtractionRun)
+            .filter(KgExtractionRun.rebuild_id == rebuild.id, KgExtractionRun.status == "failed")
+            .order_by(KgExtractionRun.id.desc())
+            .limit(10)
+            .all()
+        )
+        return {
+            "id": rebuild.id,
+            "version": rebuild.version,
+            "status": rebuild.status,
+            "total_documents": rebuild.total_documents,
+            "completed_documents": rebuild.completed_documents,
+            "failed_documents": rebuild.failed_documents,
+            "created_at": rebuild.created_at.isoformat() if rebuild.created_at else None,
+            "finished_at": rebuild.finished_at.isoformat() if rebuild.finished_at else None,
+            "failed_runs": [{"document_id": run.document_id, "error_msg": run.error_msg} for run in failed_runs],
+        }
+
+    @staticmethod
+    def retry_failed_rebuild_documents(db: Session) -> int:
+        rebuild = db.query(KgRebuild).order_by(KgRebuild.id.desc()).first()
+        if not rebuild:
+            return 0
+        runs = db.query(KgExtractionRun).filter(
+            KgExtractionRun.rebuild_id == rebuild.id,
+            KgExtractionRun.status == "failed",
+        ).all()
+        from app.tasks.kg_extract import extract_knowledge_task
+        for run in runs:
+            run.status = "queued"
+            run.error_msg = None
+            run.processed_batches = 0
+            db.commit()
+            extract_knowledge_task.delay(run.document_id, run.id)
+        if runs:
+            rebuild.status = "running"
+            rebuild.finished_at = None
+            db.commit()
+        return len(runs)
 
     @staticmethod
     def get_subgraph(subject_id: int = None, depth: int = 2) -> dict:

@@ -19,20 +19,20 @@ def parse_pdf(file_path: str) -> str:
             page_parts = []
 
             # ── Extract tables first (before text to avoid duplication) ──
-            tables = page.extract_tables()
+            table_objects = page.find_tables()
             table_regions = []
-            if tables:
-                for table in tables:
+            if table_objects:
+                for table_object in table_objects:
+                    table = table_object.extract()
                     if not table or len(table) < 1:
                         continue
                     table_md = _table_to_markdown(table)
                     if table_md:
                         page_parts.append(table_md)
-                        # Track table regions to remove duplicated text
-                        table_regions.append(_estimate_table_bbox(table))
+                        table_regions.append(table_object.bbox)
 
             # ── Extract text ──
-            text = page.extract_text(layout=True, x_tolerance=2, y_tolerance=2)
+            text = _extract_text_outside_tables(page, table_regions)
             if text and text.strip():
                 cleaned = _clean_page_text(text.strip(), table_regions)
                 if cleaned:
@@ -77,9 +77,16 @@ def _table_to_markdown(table: list) -> str:
     return "\n".join(lines)
 
 
-def _estimate_table_bbox(table: list) -> dict:
-    """Estimate bounding box of a table region for text dedup. Simplified placeholder."""
-    return {"x0": 0, "x1": 1000, "top": 0, "bottom": 1000}
+def _extract_text_outside_tables(page, table_regions: list) -> str:
+    """Keep layout-aware page text while excluding words already emitted as tables."""
+    if not table_regions:
+        return page.extract_text(layout=True, x_tolerance=2, y_tolerance=2) or ""
+
+    def outside_tables(obj):
+        midpoint = ((obj["x0"] + obj["x1"]) / 2, (obj["top"] + obj["bottom"]) / 2)
+        return not any(x0 <= midpoint[0] <= x1 and top <= midpoint[1] <= bottom for x0, top, x1, bottom in table_regions)
+
+    return page.filter(outside_tables).extract_text(layout=True, x_tolerance=2, y_tolerance=2) or ""
 
 
 def _clean_page_text(text: str, table_regions: list = None) -> str:

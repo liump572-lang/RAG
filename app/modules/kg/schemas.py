@@ -24,6 +24,9 @@ class KnowledgePointResponse(BaseModel):
     difficulty: int
     outline_path: Optional[str] = None
     neo4j_node_id: Optional[str] = None
+    origin: str = "legacy"
+    confidence: float = 1.0
+    review_status: str = "pending"
     created_at: datetime
     updated_at: datetime
 
@@ -44,6 +47,9 @@ class RelationResponse(BaseModel):
     target_node_id: int
     relation_type: str
     description: Optional[str] = None
+    origin: str = "legacy"
+    confidence: float = 1.0
+    review_status: str = "pending"
 
     class Config:
         from_attributes = True

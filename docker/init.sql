@@ -282,6 +282,9 @@ CREATE TABLE IF NOT EXISTS knowledge_points (
     difficulty TINYINT DEFAULT 3 COMMENT '难度等级1-5',
     outline_path VARCHAR(255) COMMENT '大纲章节路径',
     neo4j_node_id VARCHAR(255) COMMENT 'Neo4j节点ID',
+    origin ENUM('legacy', 'manual', 'auto') NOT NULL DEFAULT 'legacy' COMMENT '数据来源',
+    confidence DECIMAL(4,3) NOT NULL DEFAULT 1.000 COMMENT '抽取置信度',
+    review_status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending' COMMENT '审核状态',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_name (name),
@@ -297,12 +300,74 @@ CREATE TABLE IF NOT EXISTS knowledge_relations (
     relation_type ENUM('PREREQUISITE', 'NEXT', 'RELATED', 'CONTAINS', 'CONTRAST', 'EXAMINED_IN') NOT NULL COMMENT '关系类型',
     description VARCHAR(255) COMMENT '关系描述',
     neo4j_rel_id VARCHAR(255) COMMENT 'Neo4j关系ID',
+    origin ENUM('legacy', 'manual', 'auto') NOT NULL DEFAULT 'legacy' COMMENT '数据来源',
+    confidence DECIMAL(4,3) NOT NULL DEFAULT 1.000 COMMENT '抽取置信度',
+    review_status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending' COMMENT '审核状态',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE INDEX uk_relation (source_node_id, target_node_id, relation_type),
     INDEX idx_source (source_node_id),
     INDEX idx_target (target_node_id),
     INDEX idx_relation_type (relation_type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识点关系表';
+
+CREATE TABLE IF NOT EXISTS knowledge_point_sources (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    knowledge_point_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    chunk_id BIGINT,
+    raw_name VARCHAR(100) NOT NULL,
+    canonical_name VARCHAR(100) NOT NULL,
+    evidence_text TEXT,
+    extraction_batch VARCHAR(100),
+    confidence DECIMAL(4,3) NOT NULL DEFAULT 0.800,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_kps_point (knowledge_point_id),
+    INDEX idx_kps_document (document_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识点来源证据';
+
+CREATE TABLE IF NOT EXISTS kg_rebuilds (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    version VARCHAR(50) NOT NULL UNIQUE,
+    status ENUM('queued', 'running', 'success', 'partial_failed', 'failed') NOT NULL DEFAULT 'queued',
+    total_documents INT NOT NULL DEFAULT 0,
+    completed_documents INT NOT NULL DEFAULT 0,
+    failed_documents INT NOT NULL DEFAULT 0,
+    error_msg TEXT,
+    started_at DATETIME,
+    finished_at DATETIME,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识图谱重建任务';
+
+CREATE TABLE IF NOT EXISTS kg_extraction_runs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    rebuild_id BIGINT,
+    document_id BIGINT NOT NULL,
+    version VARCHAR(50) NOT NULL,
+    status ENUM('queued', 'running', 'success', 'failed') NOT NULL DEFAULT 'queued',
+    model VARCHAR(100),
+    batch_count INT NOT NULL DEFAULT 0,
+    processed_batches INT NOT NULL DEFAULT 0,
+    entity_count INT NOT NULL DEFAULT 0,
+    relation_count INT NOT NULL DEFAULT 0,
+    error_msg TEXT,
+    started_at DATETIME,
+    finished_at DATETIME,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_kger_rebuild (rebuild_id),
+    INDEX idx_kger_document (document_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识图谱文档抽取运行记录';
+
+CREATE TABLE IF NOT EXISTS kg_sync_failures (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    operation VARCHAR(50) NOT NULL,
+    entity_type VARCHAR(30) NOT NULL,
+    entity_id BIGINT,
+    payload JSON,
+    error_msg TEXT,
+    status ENUM('pending', 'resolved') NOT NULL DEFAULT 'pending',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_kgsf_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Neo4j同步补偿队列';
 
 -- 第三方题库配置表
 CREATE TABLE IF NOT EXISTS third_party_apis (

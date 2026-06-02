@@ -179,3 +179,24 @@ def generate_document(
         })
     except ValueError as e:
         return error_response(400, str(e))
+
+
+@router.get("/rebuild/status")
+def get_rebuild_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    return success_response(data=KgService.rebuild_status(db))
+
+
+@router.post("/rebuild/retry-failed")
+def retry_failed_rebuild_documents(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    count = KgService.retry_failed_rebuild_documents(db)
+    return success_response(data={"queued_documents": count})

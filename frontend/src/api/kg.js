@@ -43,3 +43,11 @@ export function searchSubgraph(params) {
 export function generateDocument(data) {
   return request.post('/kg/generate-document', data)
 }
+
+export function getRebuildStatus() {
+  return request.get('/kg/rebuild/status')
+}
+
+export function retryFailedRebuildDocuments() {
+  return request.post('/kg/rebuild/retry-failed')
+}

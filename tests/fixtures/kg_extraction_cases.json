@@ -1,0 +1,28 @@
+[
+  {
+    "name": "缩写与全称归并",
+    "subject": "深度学习",
+    "text": "卷积神经网络（CNN）常用于图像分类。CNN 由卷积层、池化层和全连接层组成。",
+    "expected_entities": ["卷积神经网络", "卷积层", "池化层", "全连接层"],
+    "expected_aliases": {"卷积神经网络": ["CNN"]},
+    "expected_relations": [
+      {"source": "卷积神经网络", "target": "卷积层", "type": "CONTAINS"}
+    ]
+  },
+  {
+    "name": "跨章节前置关系",
+    "subject": "计算机网络",
+    "text": "第一章 TCP 提供可靠传输。第二章 HTTP 通常基于 TCP 建立连接。",
+    "expected_entities": ["TCP", "HTTP"],
+    "expected_relations": [
+      {"source": "TCP", "target": "HTTP", "type": "PREREQUISITE"}
+    ]
+  },
+  {
+    "name": "表格内容不重复抽取",
+    "subject": "机器学习",
+    "text": "| 方法 | 指标 |\n| --- | --- |\n| K-means | 聚类 |\n\nK-means 是一种常见聚类算法。",
+    "expected_entities": ["K-means", "聚类算法"],
+    "expected_duplicate_entities": []
+  }
+]

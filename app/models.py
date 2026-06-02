@@ -245,6 +245,9 @@ class KnowledgePoint(Base):
     difficulty = Column(TINYINT, default=3)
     outline_path = Column(String(255))
     neo4j_node_id = Column(String(255))
+    origin = Column(SAEnum("legacy", "manual", "auto"), nullable=False, default="legacy")
+    confidence = Column(DECIMAL(4, 3), nullable=False, default=1.000)
+    review_status = Column(SAEnum("pending", "approved", "rejected"), nullable=False, default="pending")
     created_at = Column(DateTime, nullable=False, default=datetime.now)
     updated_at = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
 
@@ -258,6 +261,71 @@ class KnowledgeRelation(Base):
     relation_type = Column(SAEnum("PREREQUISITE", "NEXT", "RELATED", "CONTAINS", "CONTRAST", "EXAMINED_IN"), nullable=False)
     description = Column(String(255))
     neo4j_rel_id = Column(String(255))
+    origin = Column(SAEnum("legacy", "manual", "auto"), nullable=False, default="legacy")
+    confidence = Column(DECIMAL(4, 3), nullable=False, default=1.000)
+    review_status = Column(SAEnum("pending", "approved", "rejected"), nullable=False, default="pending")
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class KnowledgePointSource(Base):
+    __tablename__ = "knowledge_point_sources"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    knowledge_point_id = Column(BIGINT, nullable=False)
+    document_id = Column(BIGINT, nullable=False)
+    chunk_id = Column(BIGINT)
+    raw_name = Column(String(100), nullable=False)
+    canonical_name = Column(String(100), nullable=False)
+    evidence_text = Column(Text)
+    extraction_batch = Column(String(100))
+    confidence = Column(DECIMAL(4, 3), nullable=False, default=0.800)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class KgExtractionRun(Base):
+    __tablename__ = "kg_extraction_runs"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    rebuild_id = Column(BIGINT)
+    document_id = Column(BIGINT, nullable=False)
+    version = Column(String(50), nullable=False)
+    status = Column(SAEnum("queued", "running", "success", "failed"), nullable=False, default="queued")
+    model = Column(String(100))
+    batch_count = Column(Integer, nullable=False, default=0)
+    processed_batches = Column(Integer, nullable=False, default=0)
+    entity_count = Column(Integer, nullable=False, default=0)
+    relation_count = Column(Integer, nullable=False, default=0)
+    error_msg = Column(Text)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class KgRebuild(Base):
+    __tablename__ = "kg_rebuilds"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    version = Column(String(50), nullable=False, unique=True)
+    status = Column(SAEnum("queued", "running", "success", "partial_failed", "failed"), nullable=False, default="queued")
+    total_documents = Column(Integer, nullable=False, default=0)
+    completed_documents = Column(Integer, nullable=False, default=0)
+    failed_documents = Column(Integer, nullable=False, default=0)
+    error_msg = Column(Text)
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class KgSyncFailure(Base):
+    __tablename__ = "kg_sync_failures"
+
+    id = Column(BIGINT, primary_key=True, autoincrement=True)
+    operation = Column(String(50), nullable=False)
+    entity_type = Column(String(30), nullable=False)
+    entity_id = Column(BIGINT)
+    payload = Column(JSON)
+    error_msg = Column(Text)
+    status = Column(SAEnum("pending", "resolved"), nullable=False, default="pending")
     created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 

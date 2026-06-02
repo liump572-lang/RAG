@@ -112,7 +112,12 @@ def extract_structure_metadata(text: str) -> dict:
     current_content = []
 
     for line in text.split("\n"):
-        if re.match(r'^#{1,4}\s+', line):
+        markdown_heading = re.match(r'^#{1,4}\s+', line)
+        chinese_heading = re.match(
+            r'^(第[一二三四五六七八九十百\d]+[章节篇部]|[一二三四五六七八九十百\d]+[、.．]\s*)\S+',
+            line,
+        )
+        if markdown_heading or chinese_heading:
             if current_content:
                 sections.append({"heading": current_heading, "content": "\n".join(current_content)})
                 current_content = []

@@ -1,5 +1,7 @@
 import json
 import re
+import unicodedata
+from datetime import datetime
 
 from app.common.graph_store import (
     create_node as neo4j_create_node,
@@ -8,7 +10,11 @@ from app.common.graph_store import (
 )
 from app.common.llm_client import chat
 from app.database import SessionLocal
-from app.models import Document, DocumentChunk, KnowledgePoint, KnowledgeRelation, Subject
+from app.config import settings
+from app.models import (
+    Document, DocumentChunk, KgExtractionRun, KgRebuild, KgSyncFailure,
+    KnowledgePoint, KnowledgePointSource, KnowledgeRelation, Subject,
+)
 from app.tasks.celery_app import celery_app
 
 BATCH_SIZE = 10
@@ -20,11 +26,32 @@ VALID_RELATION_TYPES = {
 
 
 @celery_app.task(name="kg_task.extract_knowledge", bind=True, max_retries=2, default_retry_delay=60)
-def extract_knowledge_task(self, document_id: int):
+def extract_knowledge_task(self, document_id: int, run_id: int = None):
     db = SessionLocal()
+    run = None
     try:
+        if not run_id:
+            from app.common.schema_migrations import KG_REBUILD_VERSION
+            run = KgExtractionRun(document_id=document_id, version=KG_REBUILD_VERSION, status="queued")
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+            run_id = run.id
+        if run_id:
+            run = db.query(KgExtractionRun).filter(KgExtractionRun.id == run_id).first()
+            if run:
+                run.status = "running"
+                run.model = settings.llm_model
+                run.started_at = datetime.now()
+                db.commit()
         doc = db.query(Document).filter(Document.id == document_id).first()
         if not doc or doc.parse_status != "success":
+            if run:
+                run.status = "failed"
+                run.error_msg = "document not parsed successfully"
+                run.finished_at = datetime.now()
+                db.commit()
+                _update_rebuild_status(db, run.rebuild_id)
             return {"status": "skipped", "reason": "document not parsed successfully"}
 
         subject = db.query(Subject).filter(Subject.id == doc.subject_id).first()
@@ -37,9 +64,18 @@ def extract_knowledge_task(self, document_id: int):
             .all()
         )
         if not chunks:
+            if run:
+                run.status = "failed"
+                run.error_msg = "no chunks"
+                run.finished_at = datetime.now()
+                db.commit()
+                _update_rebuild_status(db, run.rebuild_id)
             return {"status": "skipped", "reason": "no chunks"}
 
         total_chunks = len(chunks)
+        if run:
+            run.batch_count = (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE
+            db.commit()
 
         # ── Phase 1: Batch extract entities from chunks ──
         all_kps = []
@@ -48,14 +84,26 @@ def extract_knowledge_task(self, document_id: int):
         for batch_start in range(0, total_chunks, BATCH_SIZE):
             batch = chunks[batch_start:batch_start + BATCH_SIZE]
             batch_text = _build_batch_text(doc.title, batch, batch_start, total_chunks)
-            response = _call_extract_entities(batch_text, subject_name)
-            data = _parse_json_response(response)
-            if data:
-                all_kps.extend(data.get("knowledge_points", []))
-                all_rels.extend(data.get("relations", []))
+            try:
+                response = _call_extract_entities(batch_text, subject_name)
+                data = _parse_json_response(response)
+                if data:
+                    for kp in data.get("knowledge_points", []):
+                        kp["_batch"] = f"{batch_start + 1}-{batch_start + len(batch)}"
+                        kp["_chunk_id"] = batch[0].id if batch else None
+                    all_kps.extend(data.get("knowledge_points", []))
+                    all_rels.extend(data.get("relations", []))
+            except Exception:
+                # A malformed or transient batch must not discard the rest of a large document.
+                pass
+            if run:
+                run.processed_batches = min(run.batch_count, run.processed_batches + 1)
+                db.commit()
 
         if not all_kps:
-            return {"status": "completed", "knowledge_points_created": 0, "reason": "no entities extracted"}
+            result = {"status": "completed", "knowledge_points_created": 0, "relations_created": 0, "reason": "no entities extracted"}
+            _finish_run(db, run, result)
+            return result
 
         # ── Phase 2: Merge & deduplicate entities across batches ──
         merged_kps, merged_rels = _merge_entities(all_kps, all_rels, doc.title, subject_name)
@@ -69,7 +117,7 @@ def extract_knowledge_task(self, document_id: int):
             merged_rels = _dedup_relations(merged_rels)
 
         # ── Phase 3: Store in DB and Neo4j ──
-        name_to_id = _store_knowledge_points(db, merged_kps, doc.subject_id)
+        name_to_id = _store_knowledge_points(db, merged_kps, doc.subject_id, doc.id)
 
         rel_count = _store_relations(db, merged_rels, name_to_id)
 
@@ -77,16 +125,26 @@ def extract_knowledge_task(self, document_id: int):
         cross_links = _link_to_existing_graph(db, merged_kps, name_to_id, doc.subject_id)
         rel_count += cross_links
 
-        return {
+        result = {
             "status": "success",
             "knowledge_points_created": len(name_to_id),
             "relations_created": rel_count,
             "cross_document_links": cross_links,
             "batches_processed": (total_chunks + BATCH_SIZE - 1) // BATCH_SIZE,
         }
+        _finish_run(db, run, result)
+        return result
 
     except Exception as e:
         db.rollback()
+        if run_id:
+            run = db.query(KgExtractionRun).filter(KgExtractionRun.id == run_id).first()
+            if run:
+                run.status = "failed"
+                run.error_msg = str(e)[:1000]
+                run.finished_at = datetime.now()
+                db.commit()
+                _update_rebuild_status(db, run.rebuild_id)
         return {"status": "failed", "reason": str(e)}
     finally:
         db.close()
@@ -129,11 +187,12 @@ def _call_extract_entities(batch_text: str, subject_name: str) -> str:
    - 概念A是考试中常考的知识点（EXAMINED_IN）
 6. 只提取文档中明确出现的知识点，不要凭空编造
 7. 尽量识别标准术语的全称和缩写（如"卷积神经网络（CNN）"）
+8. 为每个知识点返回 aliases（别名数组）、evidence（原文依据）和 confidence（0-1）
 
 请严格按照以下JSON格式返回，不要包含markdown代码块标记：
 {{
   "knowledge_points": [
-    {{"name": "知识点名称", "description": "知识点描述", "difficulty": 3}}
+    {{"name": "知识点名称", "aliases": ["缩写或别名"], "description": "知识点描述", "difficulty": 3, "evidence": "原文依据", "confidence": 0.85}}
   ],
   "relations": [
     {{"source": "源知识点名称", "target": "目标知识点名称", "type": "RELATED", "description": "关系描述"}}
@@ -156,26 +215,50 @@ def _merge_entities(all_kps: list, all_rels: list, doc_title: str, subject_name:
         return [], []
 
     seen_names = {}
+    canonical_names = {}
     unique_kps = []
     for kp in all_kps:
         name = kp.get("name", "").strip()
         if not name or len(name) > 100:
             continue
-        if name not in seen_names:
-            seen_names[name] = kp
+        normalized = _normalize_entity_name(name)
+        aliases = [alias.strip() for alias in kp.get("aliases", []) if isinstance(alias, str) and alias.strip()]
+        matched = seen_names.get(normalized)
+        if not matched:
+            matched = next((seen_names.get(_normalize_entity_name(alias)) for alias in aliases if seen_names.get(_normalize_entity_name(alias))), None)
+        if not matched:
+            kp["name"] = name
+            seen_names[normalized] = kp
+            for alias in aliases:
+                seen_names[_normalize_entity_name(alias)] = kp
+            canonical_names[name] = name
             unique_kps.append(kp)
         else:
-            existing = seen_names[name]
+            existing = matched
+            canonical_names[name] = existing["name"]
             if len(kp.get("description", "")) > len(existing.get("description", "")):
                 existing["description"] = kp["description"]
             if kp.get("difficulty") and not existing.get("difficulty"):
                 existing["difficulty"] = kp["difficulty"]
+            existing["aliases"] = sorted(set(existing.get("aliases", []) + kp.get("aliases", []) + [name]))
+            for alias in existing["aliases"]:
+                seen_names[_normalize_entity_name(alias)] = existing
+
+    for rel in all_rels:
+        rel["source"] = canonical_names.get(rel.get("source", "").strip(), rel.get("source", "").strip())
+        rel["target"] = canonical_names.get(rel.get("target", "").strip(), rel.get("target", "").strip())
 
     if len(unique_kps) > 40:
         unique_kps, all_rels = _llm_merge_entities(unique_kps, all_rels, doc_title, subject_name)
 
     unique_rels = _dedup_relations(all_rels)
     return unique_kps, unique_rels
+
+
+def _normalize_entity_name(name: str) -> str:
+    text = unicodedata.normalize("NFKC", name or "").strip().lower()
+    text = re.sub(r"[\s·_\-]+", "", text)
+    return re.sub(r"[()（）\[\]【】]", "", text)
 
 
 def _dedup_relations(rels: list) -> list:
@@ -206,10 +289,10 @@ def _infer_global_relationships(kps: list, doc_title: str, subject_name: str) ->
     if len(kps) < 2:
         return []
 
-    # If too many entities, use the top N by difficulty (prioritize harder concepts)
+    # Sample the complete document evenly so basic concepts are not dropped.
     if len(kps) > GLOBAL_REL_MAX_ENTITIES:
-        sorted_kps = sorted(kps, key=lambda k: k.get("difficulty", 3), reverse=True)
-        selected_kps = sorted_kps[:GLOBAL_REL_MAX_ENTITIES]
+        step = len(kps) / GLOBAL_REL_MAX_ENTITIES
+        selected_kps = [kps[int(index * step)] for index in range(GLOBAL_REL_MAX_ENTITIES)]
     else:
         selected_kps = kps
 
@@ -310,23 +393,21 @@ def _llm_merge_entities(kps: list, rels: list, doc_title: str, subject_name: str
     return kps, rels
 
 
-def _store_knowledge_points(db, kps: list, subject_id: int) -> dict:
+def _store_knowledge_points(db, kps: list, subject_id: int, document_id: int = None) -> dict:
     """Store knowledge points in MySQL and Neo4j. Returns name→id mapping."""
     name_to_id = {}
+    existing_by_normalized_name = {
+        _normalize_entity_name(point.name): point
+        for point in db.query(KnowledgePoint).filter(KnowledgePoint.subject_id == subject_id).all()
+    }
 
     for kp in kps:
         name = kp.get("name", "").strip()
         if not name:
             continue
 
-        existing = (
-            db.query(KnowledgePoint)
-            .filter(
-                KnowledgePoint.subject_id == subject_id,
-                KnowledgePoint.name == name,
-            )
-            .first()
-        )
+        normalized_name = _normalize_entity_name(name)
+        existing = existing_by_normalized_name.get(normalized_name)
 
         if existing:
             name_to_id[name] = existing.id
@@ -335,8 +416,9 @@ def _store_knowledge_points(db, kps: list, subject_id: int) -> dict:
                 db.commit()
             try:
                 neo4j_create_node(existing.id, existing.name, existing.subject_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_sync_failure(db, "upsert", "node", existing.id, {"name": existing.name}, exc)
+            _store_source(db, existing.id, document_id, kp, existing.name)
             continue
 
         point = KnowledgePoint(
@@ -344,6 +426,9 @@ def _store_knowledge_points(db, kps: list, subject_id: int) -> dict:
             subject_id=subject_id,
             description=kp.get("description", ""),
             difficulty=kp.get("difficulty", 3),
+            origin="auto",
+            confidence=_safe_confidence(kp.get("confidence")),
+            review_status="pending",
         )
         db.add(point)
         db.commit()
@@ -351,10 +436,12 @@ def _store_knowledge_points(db, kps: list, subject_id: int) -> dict:
 
         try:
             neo4j_create_node(point.id, point.name, point.subject_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "node", point.id, {"name": point.name}, exc)
 
         name_to_id[name] = point.id
+        existing_by_normalized_name[normalized_name] = point
+        _store_source(db, point.id, document_id, kp, point.name)
 
     return name_to_id
 
@@ -387,8 +474,8 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
         if existing_rel:
             try:
                 neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_sync_failure(db, "upsert", "relation", existing_rel.id, rel, exc)
             continue
 
         relation = KnowledgeRelation(
@@ -396,13 +483,16 @@ def _store_relations(db, rels: list, name_to_id: dict) -> int:
             target_node_id=tgt_id,
             relation_type=rel_type,
             description=rel_desc,
+            origin="auto",
+            confidence=_safe_confidence(rel.get("confidence")),
+            review_status="pending",
         )
         db.add(relation)
         db.commit()
         try:
             neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "relation", relation.id, rel, exc)
         count += 1
 
     return count
@@ -426,7 +516,7 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
             KnowledgePoint.subject_id == subject_id,
             ~KnowledgePoint.id.in_(new_ids),
         )
-        .limit(30)
+        .limit(120)
         .all()
     )
 
@@ -436,12 +526,12 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
     for point in existing_kps:
         try:
             neo4j_create_node(point.id, point.name, point.subject_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "node", point.id, {"name": point.name}, exc)
 
     # Select a sample of new entities to link (top by difficulty)
     sorted_new = sorted(new_kps, key=lambda k: k.get("difficulty", 3), reverse=True)
-    sample_new = sorted_new[:8]
+    sample_new = sorted_new[:20]
 
     new_text = "\n".join(
         f"- {kp['name']}：{kp.get('description', '')}"
@@ -449,7 +539,7 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
     )
     existing_text = "\n".join(
         f"- {kp.name}：{kp.description or ''}"
-        for kp in existing_kps[:20]
+        for kp in existing_kps[:80]
     )
 
     prompt = f"""你是一个知识图谱构建专家。请找出新提取的知识点和已有知识点之间的关联关系。
@@ -522,8 +612,8 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
         if existing_rel:
             try:
                 neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_sync_failure(db, "upsert", "relation", existing_rel.id, rel, exc)
             continue
 
         relation = KnowledgeRelation(
@@ -531,13 +621,16 @@ def _link_to_existing_graph(db, new_kps: list, name_to_id: dict, subject_id: int
             target_node_id=tgt_id,
             relation_type=rel_type,
             description=rel_desc,
+            origin="auto",
+            confidence=_safe_confidence(rel.get("confidence")),
+            review_status="pending",
         )
         db.add(relation)
         db.commit()
         try:
             neo4j_create_relation(src_id, tgt_id, rel_type, rel_desc)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "relation", relation.id, rel, exc)
         count += 1
 
     return count
@@ -549,6 +642,76 @@ def _parse_json_response(text: str) -> dict:
     if match:
         text = match.group()
     try:
-        return json.loads(text)
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return None
+        if "knowledge_points" in data and not isinstance(data["knowledge_points"], list):
+            return None
+        if "relations" in data and not isinstance(data["relations"], list):
+            return None
+        return data
     except json.JSONDecodeError:
         return None
+
+
+def _safe_confidence(value, default: float = 0.8) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _store_source(db, point_id: int, document_id: int, kp: dict, canonical_name: str):
+    if not document_id:
+        return
+    source = KnowledgePointSource(
+        knowledge_point_id=point_id,
+        document_id=document_id,
+        chunk_id=kp.get("_chunk_id"),
+        raw_name=kp.get("name", canonical_name)[:100],
+        canonical_name=canonical_name[:100],
+        evidence_text=(kp.get("evidence") or kp.get("description") or "")[:1000],
+        extraction_batch=kp.get("_batch"),
+        confidence=_safe_confidence(kp.get("confidence")),
+    )
+    db.add(source)
+    db.commit()
+
+
+def _record_sync_failure(db, operation: str, entity_type: str, entity_id: int, payload: dict, error: Exception):
+    db.add(KgSyncFailure(
+        operation=operation,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        payload=payload,
+        error_msg=str(error)[:1000],
+    ))
+    db.commit()
+
+
+def _finish_run(db, run: KgExtractionRun, result: dict):
+    if not run:
+        return
+    run.status = "success"
+    run.entity_count = result.get("knowledge_points_created", 0)
+    run.relation_count = result.get("relations_created", 0)
+    run.finished_at = datetime.now()
+    db.commit()
+    _update_rebuild_status(db, run.rebuild_id)
+    from app.tasks.kg_rebuild import retry_neo4j_sync_task
+    retry_neo4j_sync_task.delay()
+
+
+def _update_rebuild_status(db, rebuild_id: int):
+    if not rebuild_id:
+        return
+    rebuild = db.query(KgRebuild).filter(KgRebuild.id == rebuild_id).first()
+    if not rebuild:
+        return
+    runs = db.query(KgExtractionRun).filter(KgExtractionRun.rebuild_id == rebuild_id).all()
+    rebuild.completed_documents = sum(run.status == "success" for run in runs)
+    rebuild.failed_documents = sum(run.status == "failed" for run in runs)
+    if rebuild.completed_documents + rebuild.failed_documents >= rebuild.total_documents:
+        rebuild.status = "partial_failed" if rebuild.failed_documents else "success"
+        rebuild.finished_at = datetime.now()
+    db.commit()

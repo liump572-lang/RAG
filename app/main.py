@@ -52,6 +52,9 @@ app.include_router(notification_router, prefix="/api/v1/notifications", tags=["æ
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    from app.common.schema_migrations import ensure_kg_schema, enqueue_auto_rebuild
+    ensure_kg_schema()
+    enqueue_auto_rebuild()
 
 
 @app.get("/api/v1/health")

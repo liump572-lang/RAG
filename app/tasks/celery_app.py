@@ -5,7 +5,7 @@ celery_app = Celery(
     "knowledge_qa",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.document_parse", "app.tasks.kg_extract"],
+    include=["app.tasks.document_parse", "app.tasks.kg_extract", "app.tasks.kg_rebuild"],
 )
 
 celery_app.conf.update(
