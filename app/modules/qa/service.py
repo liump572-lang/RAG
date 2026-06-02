@@ -10,7 +10,7 @@ from app.common.utils import sanitize_markdown
 from app.config import settings
 from app.database import SessionLocal
 from app.models import Conversation, Message, SystemConfig
-from app.modules.qa.intent import detect_intent, is_meta_question
+from app.modules.qa.intent import detect_intent, is_meta_question, is_model_identity_question
 from app.modules.qa.prompt import build_prompt
 from app.modules.qa.retriever import fusion_rank, search_exam, search_graph, search_knowledge, search_notes
 
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class QaService:
+    HISTORY_LIMIT = 12
 
     @staticmethod
     def get_or_create_conversation(
@@ -65,17 +66,26 @@ class QaService:
             conv.message_count = db.query(Message).filter(
                 Message.conversation_id == conversation_id
             ).count()
-            if role == "user" and conv.title == "新对话":
-                conv.title = content[:50]
+            if role == "user" and (conv.title == "新对话" or conv.title == ""):
+                conv.title = content[:50] if content else "新对话"
+            conv.updated_at = datetime.now()
             db.commit()
 
         return msg
 
     @staticmethod
     def ask_stream(db: Session, user_id: int, question: str, conversation_id: Optional[int] = None, subject_id: Optional[int] = None):
-        conv = QaService.get_or_create_conversation(db, user_id, conversation_id, subject_id)
+        # Wrap setup in try/except so errors are reported via SSE, not as 500
+        try:
+            conv = QaService.get_or_create_conversation(db, user_id, conversation_id, subject_id)
+            user_msg = QaService.save_message(db, conv.id, "user", question, question_type="knowledge")
+        except Exception as e:
+            logger.error("Failed to create conversation or save user message: %s", e)
 
-        QaService.save_message(db, conv.id, "user", question, question_type="knowledge")
+            def error_gen():
+                yield {"data": json.dumps({"type": "error", "content": "创建对话失败: " + str(e)}, ensure_ascii=False)}
+                yield {"data": "[DONE]"}
+            return error_gen, 0
 
         intent = detect_intent(question)
 
@@ -83,23 +93,46 @@ class QaService:
         if is_meta_question(question):
             contexts = []
         else:
-            knowledge_results = search_knowledge(db, question, subject_id=subject_id)
-            exam_results = search_exam(db, question, subject_id=subject_id) if intent in ("exam", "knowledge") else []
-            note_results = search_notes(db, question, subject_id=subject_id, current_user_id=user_id) if intent in ("note",) else []
-            graph_results = search_graph(question, subject_id=subject_id)
+            try:
+                knowledge_results = search_knowledge(db, question, subject_id=subject_id)
+                exam_results = search_exam(db, question, subject_id=subject_id) if intent in ("exam", "knowledge") else []
+                note_results = search_notes(db, question, subject_id=subject_id, current_user_id=user_id) if intent in ("note",) else []
+                graph_results = search_graph(question, subject_id=subject_id)
+                contexts = fusion_rank(knowledge_results, exam_results, note_results, graph_results, intent, subject_id)
+            except Exception as e:
+                logger.warning("Search failed, falling back to direct answer: %s", e)
+                contexts = []
 
-            contexts = fusion_rank(knowledge_results, exam_results, note_results, graph_results, intent, subject_id)
-
-        messages = build_prompt(intent, question, contexts)
+        history_rows = db.query(Message).filter(
+            Message.conversation_id == conv.id,
+            Message.id < user_msg.id,
+            Message.role.in_(("user", "assistant")),
+        ).order_by(Message.id.desc()).limit(QaService.HISTORY_LIMIT).all()
+        history = [
+            {"role": row.role, "content": row.content}
+            for row in reversed(history_rows)
+        ]
+        messages = build_prompt(intent, question, contexts, history=history)
 
         # Read LLM config from DB, fallback to env
         def _cfg(key: str, fallback: str = "") -> str:
-            row = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
-            return row.config_value if row else fallback
+            try:
+                row = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
+                return row.config_value if row else fallback
+            except Exception:
+                return fallback
 
         model_name = _cfg("llm_model", settings.llm_model)
         api_key = _cfg("deepseek_api_key", settings.deepseek_api_key)
         api_base = _cfg("deepseek_api_base", settings.deepseek_api_base)
+        identity_answer = None
+        if is_model_identity_question(question):
+            identity_answer = (
+                f"当前问答服务配置的 API 模型是 **{model_name}**。\n\n"
+                "该名称来自系统控制页面保存的服务端配置，并会作为下一次提问请求中的 "
+                "`model` 参数发送给 DeepSeek API。模型自行生成的版本描述可能受训练语料限制，"
+                "不应作为实际运行配置的判断依据。"
+            )
 
         def generate():
             collected_content = ""
@@ -107,14 +140,18 @@ class QaService:
             stream_error = None
 
             try:
-                stream = chat_stream(messages, model=model_name, api_key=api_key, api_base=api_base)
-                for chunk in stream:
-                    delta = chunk.choices[0].delta
-                    if delta.content:
-                        collected_content += delta.content
-                        yield {"data": json.dumps({"type": "token", "content": delta.content}, ensure_ascii=False)}
-                    elif hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                        collected_reasoning += delta.reasoning_content
+                if identity_answer:
+                    collected_content = identity_answer
+                    yield {"data": json.dumps({"type": "token", "content": identity_answer}, ensure_ascii=False)}
+                else:
+                    stream = chat_stream(messages, model=model_name, api_key=api_key, api_base=api_base)
+                    for chunk in stream:
+                        delta = chunk.choices[0].delta
+                        if delta.content:
+                            collected_content += delta.content
+                            yield {"data": json.dumps({"type": "token", "content": delta.content}, ensure_ascii=False)}
+                        elif hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                            collected_reasoning += delta.reasoning_content
 
             except Exception as e:
                 stream_error = str(e)
@@ -134,12 +171,21 @@ class QaService:
 
                 safe_sources = []
                 for s in (contexts[:5] if contexts else []):
-                    safe_sources.append({
+                    source = {
                         "type": s.get("type", ""),
                         "content": s.get("content", "")[:200],
                         "source": s.get("source", s.get("node_name", "")),
                         "score": s.get("score", 0),
-                    })
+                    }
+                    if s.get("type") == "note":
+                        source.update({
+                            "title": s.get("title", ""),
+                            "author": s.get("author", ""),
+                            "user_id": s.get("user_id"),
+                            "status": s.get("status", "published"),
+                            "reject_reason": s.get("reject_reason", ""),
+                        })
+                    safe_sources.append(source)
 
                 assistant_msg = QaService.save_message(
                     save_db, conv.id, "assistant", final_content,
@@ -147,7 +193,7 @@ class QaService:
                     question_type=intent,
                 )
 
-                yield {"data": json.dumps({"type": "done", "conversation_id": conv.id, "message_id": assistant_msg.id, "subject_id": conv.subject_id}, ensure_ascii=False)}
+                yield {"data": json.dumps({"type": "done", "conversation_id": conv.id, "message_id": assistant_msg.id, "subject_id": conv.subject_id, "sources": safe_sources, "question_type": intent}, ensure_ascii=False)}
 
             except Exception as save_err:
                 logger.error("Failed to save assistant message for conv %s: %s", conv.id, save_err)

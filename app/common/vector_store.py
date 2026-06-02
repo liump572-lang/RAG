@@ -1,3 +1,6 @@
+import hashlib
+import math
+import re
 import time
 from typing import List, Optional
 
@@ -8,11 +11,12 @@ from app.common.llm_client import embed_text
 from app.config import settings
 
 CHROMA_COLLECTION = "document_chunks"
-EMBEDDING_DIM = 1536  # DeepSeek embedding dimension
+EMBEDDING_DIM = 384  # Keep compatible with the existing Chroma collection.
 EMBED_BATCH_SIZE = 20
 EMBED_RETRY_DELAY = 2
 
 _client = None
+_remote_embeddings_available = True
 
 
 def get_chroma_client():
@@ -40,18 +44,52 @@ def get_or_create_collection():
 
 def _embed_batch(texts: List[str]) -> List[List[float]]:
     """Embed a list of texts using DeepSeek API with retry."""
+    global _remote_embeddings_available
+    if not _remote_embeddings_available:
+        return [_local_hash_embedding(text) for text in texts]
+
     embeddings = []
     for text in texts:
         for attempt in range(3):
             try:
                 vec = embed_text(text)
+                if len(vec) != EMBEDDING_DIM:
+                    _remote_embeddings_available = False
+                    return [_local_hash_embedding(item) for item in texts]
                 embeddings.append(vec)
                 break
             except Exception as e:
+                if _is_not_found_error(e):
+                    _remote_embeddings_available = False
+                    return [_local_hash_embedding(item) for item in texts]
                 if attempt == 2:
-                    raise e
+                    return [_local_hash_embedding(item) for item in texts]
                 time.sleep(EMBED_RETRY_DELAY * (attempt + 1))
     return embeddings
+
+
+def _is_not_found_error(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(error, "response", None), "status_code", None)
+    return status_code == 404
+
+
+def _local_hash_embedding(text: str) -> List[float]:
+    """Create a deterministic offline vector for retrieval when the remote API is unavailable."""
+    vector = [0.0] * EMBEDDING_DIM
+    normalized = text.lower()
+    tokens = re.findall(r"[\u4e00-\u9fff]|[a-z0-9_]+", normalized)
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        value = int.from_bytes(digest, "big")
+        index = value % EMBEDDING_DIM
+        vector[index] += -1.0 if value & 1 else 1.0
+
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm:
+        return [value / norm for value in vector]
+    return vector
 
 
 def add_chunks(chunks: List[dict]) -> List[str]:
@@ -71,18 +109,13 @@ def add_chunks(chunks: List[dict]) -> List[str]:
             for c in batch
         ]
 
-        try:
-            embeddings = _embed_batch(documents)
-        except Exception:
-            # Fallback: let ChromaDB use its default embedding
-            collection.add(ids=ids, documents=documents, metadatas=metadatas)
-        else:
-            collection.add(
-                ids=ids,
-                documents=documents,
-                embeddings=embeddings,
-                metadatas=metadatas,
-            )
+        embeddings = _embed_batch(documents)
+        collection.add(
+            ids=ids,
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
 
         all_ids.extend(ids)
 
@@ -113,15 +146,20 @@ def search_chunks(
 
     try:
         query_embedding = embed_text(query)
+        if len(query_embedding) != EMBEDDING_DIM:
+            raise ValueError("remote embedding dimension is incompatible with the collection")
         results = collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
             where=where,
         )
-    except Exception:
-        # Fallback to ChromaDB's default embedding
+    except Exception as error:
+        if _is_not_found_error(error):
+            global _remote_embeddings_available
+            _remote_embeddings_available = False
+        # Keep retrieval available without downloading Chroma's default model.
         results = collection.query(
-            query_texts=[query],
+            query_embeddings=[_local_hash_embedding(query)],
             n_results=top_k,
             where=where,
         )

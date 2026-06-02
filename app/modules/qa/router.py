@@ -78,6 +78,8 @@ def submit_feedback(
     if not msg:
         return error_response(404, "消息不存在")
     if body.add_to_wrong:
+        if current_user.role != "user":
+            return error_response(403, "管理员不使用错题本")
         conv = db.query(Conversation).filter(Conversation.id == msg.conversation_id).first()
         question_msg = db.query(Message).filter(
             Message.conversation_id == msg.conversation_id,

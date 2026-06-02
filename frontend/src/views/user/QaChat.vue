@@ -1,6 +1,6 @@
 <template>
   <div class="chat-layout">
-    <div class="chat-sidebar">
+    <div class="chat-sidebar" @scroll.passive="handleConversationScroll">
       <div class="chat-list-header">
         <span>对话列表</span>
         <button class="btn btn-primary btn-xs" @click="newConversation">+ 新建</button>
@@ -12,6 +12,8 @@
         <div class="sub">{{ c.message_count }} 条消息</div>
       </div>
       <div v-if="!conversations.length" style="text-align:center;padding:24px;color:var(--text3);font-size:13px">暂无对话</div>
+      <div v-else-if="loadingConversations" class="chat-list-status">加载中...</div>
+      <div v-else-if="!hasMoreConversations" class="chat-list-status">已加载全部历史对话</div>
     </div>
 
     <div class="chat-main">
@@ -58,7 +60,7 @@
               <div class="feedback" v-if="msg.role === 'assistant' && msg.id">
                 <button @click="handleFeedback(msg.id, 5)" :style="{ borderColor: feedbackMap[msg.id] >= 4 ? 'var(--primary)' : '', color: feedbackMap[msg.id] >= 4 ? 'var(--primary)' : '' }">👍 有用</button>
                 <button @click="handleFeedback(msg.id, 1)" :style="{ borderColor: feedbackMap[msg.id] <= 2 ? 'var(--danger)' : '', color: feedbackMap[msg.id] <= 2 ? 'var(--danger)' : '' }">👎 无用</button>
-                <button class="wrong-btn" @click="addToWrongBook(msg, i)">📝 加入错题本</button>
+                <button v-if="auth.isUser" class="wrong-btn" @click="addToWrongBook(msg, i)">📝 加入错题本</button>
               </div>
             </div>
           </div>
@@ -67,7 +69,7 @@
         <div v-if="streaming" class="chat-msg bot">
           <div class="msg-avatar" style="background:linear-gradient(135deg,#06b6d4,#818cf8)">AI</div>
           <div class="msg-bubble">
-            <div class="markdown-body" v-html="streamContent"></div>
+            <div class="markdown-body" v-html="renderMarkdown(streamContent, { enableMermaid: false })"></div>
             <span v-if="!streamContent" style="color:var(--text3);font-size:16px">思考中<span class="dot-pulse"></span></span>
           </div>
         </div>
@@ -83,24 +85,27 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
+import { computed, ref, onMounted, nextTick } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage } from 'element-plus'
-import { askQuestion, getConversations, getMessages, deleteConversation, submitFeedback } from '@/api/qa'
+import { askQuestion, getConversations, getMessages, submitFeedback } from '@/api/qa'
 import { createWrongQuestion } from '@/api/wrongQuestions'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
-import { marked } from 'marked'
-import katex from 'katex'
-import 'katex/dist/katex.min.css'
+import { initializeMermaid, renderMarkdown } from '@/utils/markdown'
 
 const auth = useAuthStore()
 const messagesRef = ref(null)
 const activeConvId = ref(null)
 const activeConvSubjectId = ref(null)
 const conversations = ref([])
+const conversationPage = ref(1)
+const conversationTotal = ref(0)
+const loadingConversations = ref(false)
+const loadingMessages = ref(false)
 const messages = ref([])
 const question = ref('')
 const streaming = ref(false)
+const sendingMessage = ref(false)
 const streamContent = ref('')
 const feedbackMap = ref({})
 
@@ -110,20 +115,23 @@ const suggestions = [
   '进程和线程的区别',
 ]
 
+const hasMoreConversations = computed(() => conversations.value.length < conversationTotal.value)
+
 onMounted(() => {
-  fetchConversations()
+  fetchConversations(true)
 })
 
 const { refresh: refreshConversations } = useAutoRefresh(fetchConversations, 10000)
 
 async function refreshActiveMessages() {
-  if (activeConvId.value) {
+  if (activeConvId.value && !streaming.value && !sendingMessage.value) {
     const res = await getMessages(activeConvId.value)
     if (res.code === 200) {
       const serverMsgs = res.data.messages || res.data
       if (serverMsgs.length !== messages.value.length) {
         messages.value = serverMsgs
         scrollToBottom()
+        scheduleMermaid()
       }
     }
   }
@@ -139,20 +147,71 @@ function scrollToBottom() {
   })
 }
 
-async function fetchConversations() {
-  const res = await getConversations({ page: 1, size: 50 })
-  if (res.code === 200) {
-    conversations.value = res.data.items || res.data
+function mergeConversations(items, replace = false) {
+  const merged = replace ? [] : [...conversations.value]
+  const positions = new Map(merged.map((item, index) => [item.id, index]))
+  for (const item of items) {
+    if (positions.has(item.id)) {
+      merged[positions.get(item.id)] = item
+    } else {
+      positions.set(item.id, merged.length)
+      merged.push(item)
+    }
+  }
+  conversations.value = merged
+}
+
+async function fetchConversations(reset = false) {
+  if (loadingConversations.value) return
+  loadingConversations.value = true
+  try {
+    const page = reset ? 1 : 1
+    const res = await getConversations({ page, size: 50 })
+    if (res.code === 200) {
+      mergeConversations(res.data.items || res.data, reset)
+      conversationPage.value = Math.max(conversationPage.value, page)
+      conversationTotal.value = res.data.total ?? conversations.value.length
+    }
+  } finally {
+    loadingConversations.value = false
   }
 }
 
+async function loadMoreConversations() {
+  if (loadingConversations.value || !hasMoreConversations.value) return
+  loadingConversations.value = true
+  try {
+    const page = conversationPage.value + 1
+    const res = await getConversations({ page, size: 50 })
+    if (res.code === 200) {
+      mergeConversations(res.data.items || res.data)
+      conversationPage.value = page
+      conversationTotal.value = res.data.total ?? conversations.value.length
+    }
+  } finally {
+    loadingConversations.value = false
+  }
+}
+
+function handleConversationScroll(event) {
+  const el = event.currentTarget
+  if (el.scrollTop + el.clientHeight >= el.scrollHeight - 24) loadMoreConversations()
+}
+
 async function switchConversation(id) {
+  if (loadingMessages.value || id === activeConvId.value) return
   activeConvId.value = id
   const conv = conversations.value.find(c => c.id === id)
   activeConvSubjectId.value = conv?.subject_id || null
-  const res = await getMessages(id)
-  if (res.code === 200) {
-    messages.value = res.data.messages || res.data
+  loadingMessages.value = true
+  try {
+    const res = await getMessages(id)
+    if (res.code === 200 && activeConvId.value === id) {
+      messages.value = res.data.messages || res.data
+      scheduleMermaid()
+    }
+  } finally {
+    loadingMessages.value = false
   }
   scrollToBottom()
 }
@@ -173,6 +232,11 @@ async function sendMessage() {
   const userMsg = { role: 'user', content: q }
   messages.value.push(userMsg)
 
+  function removeOptimisticUserMessage() {
+    const index = messages.value.indexOf(userMsg)
+    if (index !== -1) messages.value.splice(index, 1)
+  }
+
   streaming.value = true
   streamContent.value = ''
 
@@ -187,11 +251,17 @@ async function sendMessage() {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ question: q, conversation_id: activeConvId.value }),
+      body: JSON.stringify({ question: q, conversation_id: activeConvId.value, subject_id: activeConvSubjectId.value }),
     })
     if (!resp.ok) {
+      removeOptimisticUserMessage()
       const errData = await resp.json().catch(() => ({ detail: resp.statusText }))
-      ElMessage.error('请求失败: ' + (errData.detail || resp.statusText))
+      let msg = '请求失败: ' + (errData.detail || resp.statusText)
+      if (resp.status === 422 && errData.detail) {
+        const fieldErrors = errData.detail.map?.(e => `${e.loc?.slice?.(1)?.join('.') || 'question'}: ${e.msg}`).join('; ')
+        msg = fieldErrors || msg
+      }
+      ElMessage.error(msg)
       streaming.value = false
       return
     }
@@ -200,12 +270,17 @@ async function sendMessage() {
     let buffer = ''
 
     let streamDone = false
-    let hadError = false
+    let assistantSaved = false
     let resultConvId = activeConvId.value
+    let resultSubjectId = activeConvSubjectId.value
+    sendingMessage.value = true
     while (true) {
       const { done, value } = await reader.read()
-      if (done || streamDone) break
-      buffer += decoder.decode(value, { stream: true })
+      // Process the chunk even when done is true — the last chunk may
+      // contain the "done" SSE event alongside the stream-end signal.
+      if (value) {
+        buffer += decoder.decode(value, { stream: true })
+      }
       const lines = buffer.split('\n\n')
       buffer = lines.pop() || ''
       for (const line of lines) {
@@ -223,29 +298,48 @@ async function sendMessage() {
               scrollToBottom()
             } else if (parsed.type === 'done') {
               resultConvId = parsed.conversation_id
+              resultSubjectId = parsed.subject_id || resultSubjectId
               activeConvId.value = resultConvId
-              if (parsed.subject_id) activeConvSubjectId.value = parsed.subject_id
+              if (resultSubjectId) activeConvSubjectId.value = resultSubjectId
               if (fullContent) {
-                messages.value.push({ role: 'assistant', content: fullContent })
+                messages.value.push({
+                  role: 'assistant',
+                  content: fullContent,
+                  id: parsed.message_id,
+                  sources: parsed.sources || [],
+                  question_type: parsed.question_type || null,
+                })
                 streamContent.value = ''
+                assistantSaved = true
               }
-              streaming.value = false
-              refreshAfterAnswer(resultConvId)
             } else if (parsed.type === 'error') {
-              hadError = true
               ElMessage.error(parsed.content)
             }
           } catch {}
         }
       }
+      if (done || streamDone) break
     }
     streaming.value = false
-    // If stream ended with error but without a done event, still refresh
-    if (hadError && resultConvId && streamContent.value) {
+
+    // If we got partial content but no done event, save what we have
+    if (fullContent && !assistantSaved) {
+      messages.value.push({ role: 'assistant', content: fullContent })
       streamContent.value = ''
+    }
+
+    // Refresh from server to get proper IDs and sources
+    if (resultConvId) {
       refreshAfterAnswer(resultConvId)
+    } else if (activeConvId.value) {
+      refreshAfterAnswer(activeConvId.value)
+    } else {
+      fetchConversations()
     }
   } catch (e) {
+    if (!assistantSaved) {
+      removeOptimisticUserMessage()
+    }
     ElMessage.error('请求失败：' + e.message)
     streaming.value = false
     // Try to refresh messages on network error too
@@ -257,15 +351,18 @@ async function sendMessage() {
         }
       } catch {}
     }
+  } finally {
+    sendingMessage.value = false
   }
   await nextTick()
   scrollToBottom()
+  scheduleMermaid()
 }
 
 async function handleFeedback(msgId, score) {
   try {
     feedbackMap.value[msgId] = score
-    if (score <= 2) {
+    if (score <= 2 && auth.isUser) {
       const idx = messages.value.findIndex(m => m.id === msgId)
       const msg = messages.value[idx]
       const prevMsg = idx > 0 ? messages.value[idx - 1] : null
@@ -300,9 +397,11 @@ async function refreshAfterAnswer(convId) {
   }
   await nextTick()
   scrollToBottom()
+  scheduleMermaid()
 }
 
 async function addToWrongBook(msg, idx) {
+  if (!auth.isUser) return
   try {
     const prevMsg = idx > 0 ? messages.value[idx - 1] : null
     await createWrongQuestion({
@@ -318,73 +417,8 @@ async function addToWrongBook(msg, idx) {
   }
 }
 
-// ── marked configuration ──
-marked.setOptions({
-  breaks: true,
-  gfm: true,
-})
-
-// Custom renderer for code blocks (mermaid support)
-const defaultRenderer = new marked.Renderer()
-defaultRenderer.code = function ({ text, lang }) {
-  if (lang === 'mermaid') {
-    return `<div class="mermaid">${text}</div>`
-  }
-  const langAttr = lang ? ` class="language-${lang}"` : ''
-  return `<pre><code${langAttr}>${text}</code></pre>`
-}
-
-// Custom table renderer with proper classes
-defaultRenderer.table = function ({ header, rows }) {
-  const h = header.map(c => `<th>${c}</th>`).join('')
-  const r = rows.map(row => `<tr>${row.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')
-  return `<div class="table-wrapper"><table><thead><tr>${h}</tr></thead><tbody>${r}</tbody></table></div>`
-}
-
-marked.setOptions({ renderer: defaultRenderer })
-
-function renderMarkdown(text) {
-  if (!text) return ''
-
-  // Pre-process: protect LaTeX from being mangled by marked
-  const mathBlocks = []
-  const mathInline = []
-
-  // $$ block math
-  text = text.replace(/\$\$([\s\S]*?)\$\$/g, (_, formula) => {
-    const idx = mathBlocks.length
-    mathBlocks.push(formula.trim())
-    return `@@MATHBLOCK${idx}@@`
-  })
-
-  // $ inline math
-  text = text.replace(/\$(.+?)\$/g, (_, formula) => {
-    const idx = mathInline.length
-    mathInline.push(formula.trim())
-    return `@@MATHINLINE${idx}@@`
-  })
-
-  // Render markdown via marked
-  let html = marked.parse(text)
-
-  // Restore LaTeX
-  html = html.replace(/@@MATHBLOCK(\d+)@@/g, (_, idx) => {
-    try {
-      return katex.renderToString(mathBlocks[idx], { displayMode: true, throwOnError: false })
-    } catch {
-      return `<pre>${mathBlocks[idx]}</pre>`
-    }
-  })
-
-  html = html.replace(/@@MATHINLINE(\d+)@@/g, (_, idx) => {
-    try {
-      return katex.renderToString(mathInline[idx], { displayMode: false, throwOnError: false })
-    } catch {
-      return `<code>${mathInline[idx]}</code>`
-    }
-  })
-
-  return html
+function scheduleMermaid() {
+  nextTick(() => initializeMermaid(messagesRef.value))
 }
 
 function getNoteSources(sources) {
@@ -429,54 +463,55 @@ function noteStatusLabel(status) {
   60%, 100% { content: '...'; }
 }
 .markdown-body { line-height: 1.7; font-size: 14px; white-space: normal; }
-.markdown-body h1 { font-size: 18px; margin: 8px 0; }
-.markdown-body h2 { font-size: 16px; margin: 6px 0; }
-.markdown-body h3 { font-size: 14px; margin: 4px 0; }
-.markdown-body code { background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-.markdown-body pre { background: rgba(0,0,0,0.3); padding: 14px; border-radius: 8px; overflow-x: auto; margin: 8px 0; border: 1px solid var(--border); }
-.markdown-body pre code { background: transparent; padding: 0; }
-.markdown-body ul, .markdown-body ol { padding-left: 20px; margin: 4px 0; }
-.markdown-body li { margin: 2px 0; }
+.markdown-body :deep(h1) { font-size: 18px; margin: 8px 0; }
+.markdown-body :deep(h2) { font-size: 16px; margin: 6px 0; }
+.markdown-body :deep(h3) { font-size: 14px; margin: 4px 0; }
+.markdown-body :deep(code) { background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+.markdown-body :deep(pre) { background: rgba(0,0,0,0.3); padding: 14px; border-radius: 8px; overflow-x: auto; margin: 8px 0; border: 1px solid var(--border); }
+.markdown-body :deep(pre code) { background: transparent; padding: 0; }
+.markdown-body :deep(ul), .markdown-body :deep(ol) { padding-left: 20px; margin: 4px 0; }
+.markdown-body :deep(li) { margin: 2px 0; }
 
 /* ── Table styles ── */
-.markdown-body .table-wrapper {
+.markdown-body :deep(.table-wrapper) {
   overflow-x: auto;
   margin: 12px 0;
   border-radius: 8px;
   border: 1px solid var(--border);
 }
-.markdown-body table {
+.markdown-body :deep(table) {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
   line-height: 1.6;
+  border: 1px solid rgba(148,163,184,0.45);
 }
-.markdown-body thead {
+.markdown-body :deep(thead) {
   background: linear-gradient(135deg, rgba(124,58,237,0.15), rgba(99,102,241,0.1));
 }
-.markdown-body thead th {
+.markdown-body :deep(thead th) {
   padding: 10px 14px;
   text-align: center;
   font-weight: 600;
   color: var(--text);
-  border-bottom: 2px solid var(--border);
+  border: 1px solid rgba(148,163,184,0.55);
   white-space: nowrap;
 }
-.markdown-body tbody td {
+.markdown-body :deep(tbody td) {
   padding: 8px 14px;
   text-align: center;
   color: var(--text2);
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+  border: 1px solid rgba(148,163,184,0.35);
 }
-.markdown-body tbody tr:hover {
+.markdown-body :deep(tbody tr:hover) {
   background: rgba(124,58,237,0.06);
 }
-.markdown-body tbody tr:last-child td {
+.markdown-body :deep(tbody tr:last-child td) {
   border-bottom: none;
 }
 
 /* ── Mermaid diagram styles ── */
-.markdown-body .mermaid {
+.markdown-body :deep(.mermaid) {
   margin: 12px 0;
   padding: 16px;
   background: rgba(255,255,255,0.03);
@@ -486,11 +521,11 @@ function noteStatusLabel(status) {
 }
 
 /* ── LaTeX math styles ── */
-.markdown-body .katex-display {
+.markdown-body :deep(.katex-display) {
   margin: 12px 0;
   overflow-x: auto;
 }
-.markdown-body .katex {
+.markdown-body :deep(.katex) {
   font-size: 1.1em;
 }
 .feedback { margin-top: 10px; display: flex; gap: 6px; }
@@ -529,6 +564,12 @@ function noteStatusLabel(status) {
 }
 .chat-item .sub {
   font-size: 12px; color: var(--text3); margin-top: 4px;
+}
+.chat-list-status {
+  padding: 12px 16px;
+  text-align: center;
+  color: var(--text3);
+  font-size: 12px;
 }
 
 .msg-enter-active {

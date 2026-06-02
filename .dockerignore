@@ -1,0 +1,17 @@
+.git/
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+.idea/
+tests/
+knowledge_docs/
+uploads/
+资料/
+开发计划.docx
+数据库设计说明书.docx
+详细设计说明书.docx
+概要设计说明书.docx
+需求说明书.docx
+原型.html

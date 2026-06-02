@@ -89,72 +89,63 @@ def delete_relation(source_id: int, target_id: int, rel_type: str) -> bool:
     return True
 
 
+def _node_payload(node: dict) -> dict:
+    return {
+        "id": node["id"],
+        "label": node.get("name", ""),
+        "subject_id": node.get("subject_id"),
+        "group": str(node.get("subject_id", 0)),
+    }
+
+
+def _edge_payload(edge: dict) -> dict:
+    return {
+        "from": edge["source"],
+        "to": edge["target"],
+        "label": edge.get("type", ""),
+        "title": edge.get("description", "") or edge.get("type", ""),
+    }
+
+
 def get_subgraph(subject_id: int = None, depth: int = 2) -> dict:
+    node_query = "MATCH (n:KnowledgePoint)"
+    params = {}
     if subject_id:
-        query = """
-            MATCH (n:KnowledgePoint)
-            WHERE n.subject_id = $subject_id
-            OPTIONAL MATCH (n)-[r:RELATED]-(m:KnowledgePoint)
-            RETURN collect(DISTINCT {id: n.id, name: n.name, subject_id: n.subject_id, difficulty: n.difficulty}) as nodes,
-                   collect(DISTINCT {source_id: r.type}) as rels
-        """
-        params = {"subject_id": subject_id}
-    else:
-        query = """
-            MATCH (n:KnowledgePoint)
-            OPTIONAL MATCH (n)-[r:RELATED]-(m:KnowledgePoint)
-            RETURN collect(DISTINCT {id: n.id, name: n.name, subject_id: n.subject_id}) as nodes,
-                   collect(DISTINCT {}) as rels
-        """
-        params = {}
+        node_query += " WHERE n.subject_id = $subject_id"
+        params["subject_id"] = subject_id
+    node_query += " RETURN n.id as id, n.name as name, n.subject_id as subject_id LIMIT 300"
 
-    results = run_query(query, params)
-    if not results:
-        return {"nodes": [], "edges": []}
+    edge_query = "MATCH (a:KnowledgePoint)-[r:RELATED]->(b:KnowledgePoint)"
+    if subject_id:
+        edge_query += " WHERE a.subject_id = $subject_id AND b.subject_id = $subject_id"
+    edge_query += """
+        RETURN a.id as source, a.name as source_name, a.subject_id as source_subject_id,
+               b.id as target, b.name as target_name, b.subject_id as target_subject_id,
+               r.type as type, r.description as description
+        LIMIT 300
+    """
 
-    data = results[0]
-    nodes = {}
+    nodes = {_node["id"]: _node_payload(_node) for _node in run_query(node_query, params)}
     edges = []
     seen = set()
-
-    for n in data.get("nodes", []):
-        if n.get("id") and n["id"] not in nodes:
-            nodes[n["id"]] = {
-                "id": n["id"],
-                "label": n.get("name", ""),
-                "subject_id": n.get("subject_id"),
-                "group": str(n.get("subject_id", 0)),
-            }
-
-    edge_query = """
-        MATCH (a:KnowledgePoint)-[r:RELATED]->(b:KnowledgePoint)
-    """
-    if subject_id:
-        edge_query += " WHERE a.subject_id = $subject_id OR b.subject_id = $subject_id"
-    edge_query += " RETURN a.id as source, b.id as target, r.type as type, r.description as description"
-    edge_query += " LIMIT 200"
-
-    edge_results = run_query(edge_query, {"subject_id": subject_id} if subject_id else {})
-    for e in edge_results:
-        if e.get("source") and e.get("target"):
-            edge_key = f"{e['source']}-{e['target']}-{e.get('type', '')}"
-            if edge_key not in seen:
-                seen.add(edge_key)
-                edges.append({
-                    "from": e["source"],
-                    "to": e["target"],
-                    "label": e.get("type", ""),
-                    "title": e.get("description", ""),
-                })
-            if e["source"] not in nodes:
-                nodes[e["source"]] = {"id": e["source"], "label": str(e["source"]), "group": "0"}
-            if e["target"] not in nodes:
-                nodes[e["target"]] = {"id": e["target"], "label": str(e["target"]), "group": "0"}
-
+    for edge in run_query(edge_query, params):
+        key = (edge.get("source"), edge.get("target"), edge.get("type", ""))
+        if None not in key and key not in seen:
+            seen.add(key)
+            nodes[edge["source"]] = _node_payload({
+                "id": edge["source"], "name": edge["source_name"], "subject_id": edge["source_subject_id"],
+            })
+            nodes[edge["target"]] = _node_payload({
+                "id": edge["target"], "name": edge["target_name"], "subject_id": edge["target_subject_id"],
+            })
+            edges.append(_edge_payload(edge))
     return {"nodes": list(nodes.values()), "edges": edges}
 
 
 def search_nodes(keyword: str, subject_id: int = None) -> list:
+    keyword = keyword.strip()
+    if not keyword:
+        return []
     conditions = ["n.name CONTAINS $keyword"]
     params = {"keyword": keyword}
     if subject_id:
@@ -172,71 +163,65 @@ def search_nodes(keyword: str, subject_id: int = None) -> list:
 
 
 def get_search_subgraph(keyword: str, subject_id: int = None, depth: int = 1) -> dict:
-    ids_param = {"keyword": f"%{keyword}%"}
-    id_conditions = ["n.name CONTAINS $keyword"]
-    if subject_id:
-        id_conditions.append("n.subject_id = $subject_id")
-        ids_param["subject_id"] = subject_id
-    id_where = " AND ".join(id_conditions)
-
-    matched = run_query(f"""
-        MATCH (n:KnowledgePoint)
-        WHERE {id_where}
-        RETURN n.id as id, n.name as name, n.subject_id as subject_id
-        LIMIT 20
-    """, ids_param)
-
-    if not matched:
+    keyword = keyword.strip()
+    if not keyword:
         return {"nodes": [], "edges": []}
 
-    matched_ids = [n["id"] for n in matched]
+    params = {"keyword": keyword}
+    node_conditions = ["n.name CONTAINS $keyword"]
+    if subject_id:
+        node_conditions.append("n.subject_id = $subject_id")
+        params["subject_id"] = subject_id
+    node_where = " AND ".join(node_conditions)
 
-    neighbors = run_query("""
-        MATCH (n:KnowledgePoint)-[r:RELATED]-(m:KnowledgePoint)
-        WHERE n.id IN $ids
-        RETURN DISTINCT m.id as id, m.name as name, m.subject_id as subject_id
+    matched_nodes = run_query(f"""
+        MATCH (n:KnowledgePoint)
+        WHERE {node_where}
+        RETURN n.id as id, n.name as name, n.subject_id as subject_id
         LIMIT 50
-    """, {"ids": matched_ids})
+    """, params)
 
-    all_edges = run_query("""
+    relation_conditions = [
+        "(r.type CONTAINS $keyword OR coalesce(r.description, '') CONTAINS $keyword)"
+    ]
+    if subject_id:
+        relation_conditions.append("a.subject_id = $subject_id AND b.subject_id = $subject_id")
+    relation_where = " AND ".join(relation_conditions)
+    matched_edges = run_query(f"""
         MATCH (a:KnowledgePoint)-[r:RELATED]->(b:KnowledgePoint)
-        WHERE a.id IN $ids OR b.id IN $ids
-        RETURN DISTINCT a.id as source, b.id as target, r.type as type
+        WHERE {relation_where}
+        RETURN DISTINCT a.id as source, a.name as source_name, a.subject_id as source_subject_id,
+                        b.id as target, b.name as target_name, b.subject_id as target_subject_id,
+                        r.type as type, r.description as description
         LIMIT 100
-    """, {"ids": matched_ids})
+    """, params)
 
     nodes_map = {}
-    for n in matched + neighbors:
-        nid = n.get("id")
-        if nid is not None and nid not in nodes_map:
-            nodes_map[nid] = {
-                "id": nid,
-                "label": n.get("name", ""),
-                "subject_id": n.get("subject_id"),
-                "group": str(n.get("subject_id", 0)),
-            }
+    for node in matched_nodes:
+        nodes_map[node["id"]] = _node_payload(node)
 
-    edges = []
-    seen = set()
-    for e in all_edges:
-        src, tgt = e.get("source"), e.get("target")
-        if src is None or tgt is None:
-            continue
-        key = f"{src}-{tgt}-{e.get('type', '')}"
-        if key not in seen:
-            seen.add(key)
-            edges.append({
-                "from": src,
-                "to": tgt,
-                "label": e.get("type", ""),
-                "title": e.get("type", ""),
-            })
-            if src not in nodes_map:
-                nodes_map[src] = {"id": src, "label": str(src), "group": "0"}
-            if tgt not in nodes_map:
-                nodes_map[tgt] = {"id": tgt, "label": str(tgt), "group": "0"}
+    for edge in matched_edges:
+        nodes_map[edge["source"]] = _node_payload({
+            "id": edge["source"], "name": edge["source_name"], "subject_id": edge["source_subject_id"],
+        })
+        nodes_map[edge["target"]] = _node_payload({
+            "id": edge["target"], "name": edge["target_name"], "subject_id": edge["target_subject_id"],
+        })
 
-    return {"nodes": list(nodes_map.values()), "edges": edges}
+    visible_ids = list(nodes_map)
+    if not visible_ids:
+        return {"nodes": [], "edges": []}
+
+    visible_edges = run_query("""
+        MATCH (a:KnowledgePoint)-[r:RELATED]->(b:KnowledgePoint)
+        WHERE a.id IN $ids AND b.id IN $ids
+        RETURN DISTINCT a.id as source, b.id as target, r.type as type, r.description as description
+        LIMIT 100
+    """, {"ids": visible_ids})
+    return {
+        "nodes": list(nodes_map.values()),
+        "edges": [_edge_payload(edge) for edge in visible_edges],
+    }
 
 
 def close():

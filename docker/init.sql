@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS system_configs (
 INSERT IGNORE INTO system_configs (config_key, config_value, description) VALUES
     ('deepseek_api_key', '', '大模型API Key'),
     ('deepseek_api_base', 'https://api.deepseek.com/v1', '大模型API地址'),
-    ('llm_model', 'deepseek-v4-pro', '对话模型名称'),
+    ('llm_model', 'deepseek-v4-flash', '对话模型名称'),
     ('embedding_model', 'deepseek-embedding', 'Embedding模型名称'),
     ('llm.temperature', '0.7', '生成温度'),
     ('llm.max_tokens', '4096', '最大Token数'),

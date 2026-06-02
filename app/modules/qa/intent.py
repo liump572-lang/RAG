@@ -34,6 +34,16 @@ def is_meta_question(question: str) -> bool:
     return False
 
 
+def is_model_identity_question(question: str) -> bool:
+    """Return whether the user is asking which configured model serves Q&A."""
+    normalized = re.sub(r"\s+", "", question).lower()
+    if not any(keyword in normalized for keyword in ("模型", "版本", "deepseek", "大模型", "llm")):
+        return False
+    return any(keyword in normalized for keyword in (
+        "你现在", "你是", "你用", "你使用", "当前", "这个系统", "这个助手",
+    ))
+
+
 def detect_intent(question: str) -> str:
     for intent, patterns in KEYWORD_PATTERNS.items():
         for p in patterns:

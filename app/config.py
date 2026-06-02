@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     # DeepSeek LLM
     deepseek_api_key: str = ""
     deepseek_api_base: str = "https://api.deepseek.com/v1"
-    llm_model: str = "deepseek-chat"
+    llm_model: str = "deepseek-v4-flash"
     embedding_model: str = "deepseek-embedding"
 
     # JWT

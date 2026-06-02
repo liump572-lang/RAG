@@ -6,7 +6,7 @@ from datetime import datetime
 class AskInput(BaseModel):
     conversation_id: Optional[int] = Field(default=None, description="对话ID，为空则创建新对话")
     subject_id: Optional[int] = Field(default=None, description="科目ID")
-    question: str = Field(..., min_length=1, max_length=5000, description="用户问题")
+    question: str = Field(..., min_length=1, max_length=50000, description="用户问题")
 
 
 class AskOutput(BaseModel):
@@ -20,6 +20,7 @@ class ConversationResponse(BaseModel):
     id: int
     title: str
     message_count: int
+    subject_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 

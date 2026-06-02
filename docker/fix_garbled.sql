@@ -20,7 +20,7 @@ WHERE config_key IN ('llm.api_key', 'llm.api_base', 'llm.model', 'embedding.mode
 INSERT IGNORE INTO system_configs (config_key, config_value, description) VALUES
     ('deepseek_api_key', '', '大模型API Key'),
     ('deepseek_api_base', 'https://api.deepseek.com/v1', '大模型API地址'),
-    ('llm_model', 'deepseek-v4-pro', '对话模型名称'),
+    ('llm_model', 'deepseek-v4-flash', '对话模型名称'),
     ('embedding_model', 'deepseek-embedding', 'Embedding模型名称');
 
 -- 4. 验证修复结果

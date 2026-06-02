@@ -105,10 +105,17 @@ DIRECT_PROMPT = """你是一个专业的计算机学科知识问答助手。用�
 """ + FORMATTING_RULES
 
 
-def build_prompt(intent: str, question: str, contexts: List[dict]) -> list:
+def build_prompt(intent: str, question: str, contexts: List[dict], history: Optional[List[dict]] = None) -> list:
+    history_messages = [
+        {"role": item["role"], "content": item["content"]}
+        for item in (history or [])
+        if item.get("role") in ("user", "assistant") and item.get("content")
+    ]
+
     if not contexts:
         return [
             {"role": "system", "content": DIRECT_PROMPT},
+            *history_messages,
             {"role": "user", "content": question},
         ]
 
@@ -147,5 +154,6 @@ def build_prompt(intent: str, question: str, contexts: List[dict]) -> list:
 
     return [
         {"role": "system", "content": template.format(context=context_str, question=question)},
-        {"role": "user", "content": "请根据以上系统指令中的参考资料回答我的问题。"},
+        *history_messages,
+        {"role": "user", "content": question},
     ]

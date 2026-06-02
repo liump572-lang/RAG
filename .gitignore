@@ -37,6 +37,7 @@ uploads_data/
 
 # Uploaded files
 uploads/
+knowledge_docs/
 
 # Node
 node_modules/

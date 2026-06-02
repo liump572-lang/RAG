@@ -174,7 +174,7 @@ class KbService:
                 doc.parse_status = "success"
                 doc.chunk_count = 0
                 doc.error_msg = "文档内容过短，跳过解析"
-                doc.commit()
+                db.commit()
                 return {"status": "skipped", "reason": "content too short"}
 
             # ── Extract structure metadata for section context ──

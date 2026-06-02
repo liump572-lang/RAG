@@ -284,7 +284,7 @@ npm run dev
 |------|------|--------|
 | `DEEPSEEK_API_KEY` | DeepSeek API 密钥（**必填**） | - |
 | `DEEPSEEK_API_BASE` | DeepSeek API 地址 | `https://api.deepseek.com/v1` |
-| `LLM_MODEL` | 对话模型名称 | `deepseek-chat` |
+| `LLM_MODEL` | 对话模型名称 | `deepseek-v4-flash` |
 | `EMBEDDING_MODEL` | Embedding 模型名称 | `deepseek-embedding` |
 | `DATABASE_URL` | MySQL 连接字符串 | `mysql+pymysql://...` |
 | `REDIS_HOST` | Redis 主机 | `redis` |
