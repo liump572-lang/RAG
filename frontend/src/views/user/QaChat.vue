@@ -528,6 +528,21 @@ function noteStatusLabel(status) {
   border: 1px solid var(--border);
   overflow-x: auto;
 }
+.markdown-body :deep(.mermaid-fallback) {
+  margin: 12px 0;
+}
+.markdown-body :deep(.mermaid-fallback-notice) {
+  padding: 8px 12px;
+  color: #f59e0b;
+  background: rgba(245,158,11,0.1);
+  border: 1px solid rgba(245,158,11,0.25);
+  border-radius: 8px 8px 0 0;
+  font-size: 12px;
+}
+.markdown-body :deep(.mermaid-fallback pre) {
+  margin-top: 0;
+  border-radius: 0 0 8px 8px;
+}
 
 /* ── LaTeX math styles ── */
 .markdown-body :deep(.katex-display) {

@@ -92,9 +92,35 @@ export async function initializeMermaid(container) {
   const nodes = container.querySelectorAll('.mermaid:not([data-processed="true"])')
   if (!nodes.length) return
 
-  try {
-    await mermaid.run({ nodes })
-  } catch (error) {
-    console.warn('Mermaid render failed:', error)
+  for (const node of nodes) {
+    const source = node.textContent || ''
+    try {
+      await mermaid.parse(source)
+      await mermaid.run({ nodes: [node], suppressErrors: true })
+    } catch (error) {
+      console.warn('Mermaid render failed:', error)
+      showMermaidFallback(node, source)
+    }
+  }
+}
+
+function showMermaidFallback(node, source) {
+  const wrapper = document.createElement('div')
+  wrapper.className = 'mermaid-fallback'
+
+  const notice = document.createElement('div')
+  notice.className = 'mermaid-fallback-notice'
+  notice.textContent = '流程图语法无法解析，已保留原始内容'
+
+  const pre = document.createElement('pre')
+  const code = document.createElement('code')
+  code.className = 'language-mermaid'
+  code.textContent = source
+  pre.appendChild(code)
+
+  wrapper.appendChild(notice)
+  wrapper.appendChild(pre)
+  if (node.isConnected) {
+    node.replaceWith(wrapper)
   }
 }
