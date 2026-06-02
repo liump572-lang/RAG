@@ -64,17 +64,6 @@
           <div ref="graphRef" class="graph-canvas"></div>
           <el-empty v-if="!loading && graphData.nodes.length === 0" description="暂无图谱数据，请先导入种子数据" />
           <div class="graph-hint">滚轮缩放 · 拖拽平移 · 点击节点查看详情</div>
-          <div class="graph-pan-controls">
-            <button class="pan-button pan-up" title="向上移动画布" @click="panGraph('up')">↑</button>
-            <button class="pan-button pan-left" title="向左移动画布" @click="panGraph('left')">←</button>
-            <button class="pan-button pan-down" title="向下移动画布" @click="panGraph('down')">↓</button>
-            <button class="pan-button pan-right" title="向右移动画布" @click="panGraph('right')">→</button>
-          </div>
-          <div class="graph-zoom-controls">
-            <button class="pan-button" title="适应画布" @click="fitGraph">□</button>
-            <button class="pan-button" title="缩小画布" @click="zoomGraph(0.85)">−</button>
-            <button class="pan-button" title="放大画布" @click="zoomGraph(1.15)">+</button>
-          </div>
         </el-card>
         <div class="graph-legend">
           <div class="legend-title">关系</div>
@@ -740,34 +729,6 @@ function fitGraph() {
   }
 }
 
-function panGraph(direction) {
-  if (!network) return
-  const pos = network.getViewPosition()
-  const step = 120 / network.getScale()
-  const offsets = {
-    up: { x: 0, y: step },
-    down: { x: 0, y: -step },
-    left: { x: step, y: 0 },
-    right: { x: -step, y: 0 },
-  }
-  const offset = offsets[direction]
-  if (!offset) return
-  network.moveTo({
-    position: { x: pos.x + offset.x, y: pos.y + offset.y },
-    animation: { duration: 180, easingFunction: 'easeInOutQuad' },
-  })
-  window.setTimeout(() => clampGraphView?.(), 200)
-}
-
-function zoomGraph(factor) {
-  if (!network) return
-  network.moveTo({
-    scale: Math.min(2.5, Math.max(0.08, network.getScale() * factor)),
-    animation: { duration: 180, easingFunction: 'easeInOutQuad' },
-  })
-  window.setTimeout(() => clampGraphView?.(), 200)
-}
-
 async function handleSearch() {
   filter.value.keyword = filter.value.keyword.trim()
   if (filter.value.keyword) {
@@ -991,50 +952,6 @@ async function handleSaveEdge() {
   border-radius: 20px;
   white-space: nowrap;
   border: 1px solid rgba(203,213,225,0.3);
-}
-
-.graph-pan-controls,
-.graph-zoom-controls {
-  position: absolute;
-  z-index: 2;
-  display: grid;
-  gap: 6px;
-}
-.graph-pan-controls {
-  left: 18px;
-  bottom: 18px;
-  grid-template-columns: repeat(3, 36px);
-  grid-template-rows: repeat(2, 36px);
-}
-.graph-zoom-controls {
-  right: 18px;
-  bottom: 18px;
-  grid-template-columns: repeat(2, 36px);
-  grid-template-rows: repeat(2, 36px);
-}
-.pan-up { grid-column: 2; }
-.pan-left { grid-column: 1; grid-row: 2; }
-.pan-down { grid-column: 2; grid-row: 2; }
-.pan-right { grid-column: 3; grid-row: 2; }
-.pan-button {
-  width: 36px;
-  height: 36px;
-  padding: 0;
-  border: 2px solid #22c55e;
-  border-radius: 50%;
-  background: rgba(240, 253, 244, 0.92);
-  color: #16a34a;
-  cursor: pointer;
-  font-size: 24px;
-  line-height: 30px;
-  transition: background-color 0.15s ease, transform 0.15s ease;
-}
-.pan-button:hover {
-  background: #dcfce7;
-  transform: scale(1.06);
-}
-.graph-zoom-controls .pan-button:first-child {
-  grid-column: 2;
 }
 
 /* ── Legend ── */
