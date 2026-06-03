@@ -387,8 +387,14 @@ class KgService:
         return True
 
     @staticmethod
-    def get_subgraph(db: Session, subject_id: int = None, depth: int = 2) -> dict:
-        return KgService._mysql_subgraph(db, subject_id)
+    def get_subgraph(
+        db: Session,
+        subject_id: int = None,
+        depth: int = 2,
+        offset: int = 0,
+        size: int = 600,
+    ) -> dict:
+        return KgService._mysql_subgraph(db, subject_id, offset, size)
 
     @staticmethod
     def search_subgraph(db: Session, keyword: str, subject_id: int = None) -> dict:
@@ -441,11 +447,12 @@ class KgService:
         }
 
     @staticmethod
-    def _mysql_subgraph(db: Session, subject_id: int = None) -> dict:
+    def _mysql_subgraph(db: Session, subject_id: int = None, offset: int = 0, size: int = 600) -> dict:
         point_query = db.query(KnowledgePoint)
         if subject_id:
             point_query = point_query.filter(KnowledgePoint.subject_id == subject_id)
-        points = point_query.order_by(KnowledgePoint.id).all()
+        total_nodes = point_query.count()
+        points = point_query.order_by(KnowledgePoint.id).offset(offset).limit(size).all()
         point_ids = {point.id for point in points}
 
         rel_query = db.query(KnowledgeRelation)
@@ -454,13 +461,23 @@ class KgService:
                 KnowledgePoint,
                 KnowledgeRelation.source_node_id == KnowledgePoint.id,
             ).filter(KnowledgePoint.subject_id == subject_id)
-        relations = [
-            rel for rel in rel_query.order_by(KnowledgeRelation.id).all()
-            if rel.source_node_id in point_ids and rel.target_node_id in point_ids
-        ]
+        total_edges = rel_query.count()
+        relations = []
+        if point_ids:
+            relations = rel_query.filter(
+                KnowledgeRelation.source_node_id.in_(point_ids),
+                KnowledgeRelation.target_node_id.in_(point_ids),
+            ).order_by(KnowledgeRelation.id).all()
+        next_offset = offset + len(points)
         return {
             "nodes": [KgService._node_payload(point) for point in points],
             "edges": [KgService._edge_payload(rel) for rel in relations],
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "offset": offset,
+            "size": size,
+            "next_offset": next_offset,
+            "has_more": next_offset < total_nodes,
         }
 
     @staticmethod

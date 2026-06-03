@@ -25,10 +25,12 @@ router = APIRouter()
 def get_subgraph(
     subject_id: Optional[int] = Query(None),
     depth: int = Query(2, ge=1, le=5),
+    offset: int = Query(0, ge=0),
+    size: int = Query(600, ge=100, le=2000),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    data = KgService.get_subgraph(db, subject_id, depth)
+    data = KgService.get_subgraph(db, subject_id, depth, offset, size)
     return success_response(data=data)
 
 

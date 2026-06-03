@@ -11,7 +11,7 @@
           <el-input v-model="filter.keyword" placeholder="搜索实体或关系..." clearable style="width:200px" @keyup.enter="handleSearch" @clear="handleClearSearch" />
         </el-form-item>
         <el-form-item>
-          <el-button @click="fetchGraph">刷新图谱</el-button>
+          <el-button @click="refreshGraph">刷新图谱</el-button>
           <el-button type="primary" @click="showAddNode">+ 手动添加</el-button>
           <el-button type="success" @click="showAddEdge">添加关系</el-button>
           <el-button type="warning" @click="showGenerateDoc">生成文档</el-button>
@@ -64,6 +64,20 @@
           <div ref="graphRef" class="graph-canvas"></div>
           <el-empty v-if="!loading && graphData.nodes.length === 0" description="暂无图谱数据，请先导入种子数据" />
           <div class="graph-hint">滚轮缩放 · 拖拽平移 · 点击节点查看详情</div>
+          <div v-if="!isSearchMode && graphPageInfo.total_nodes" class="graph-load-panel">
+            <span>
+              已缓存 {{ graphData.nodes.length }} / {{ graphPageInfo.total_nodes }} 个节点，
+              当前显示 {{ graphData.edges.length }} / {{ graphPageInfo.total_edges || 0 }} 条关系
+            </span>
+            <el-button
+              v-if="graphPageInfo.has_more"
+              size="small"
+              type="primary"
+              plain
+              :loading="loadingMoreGraph"
+              @click="loadMoreGraph"
+            >加载更多</el-button>
+          </div>
         </el-card>
         <div class="graph-legend">
           <div class="legend-title">关系</div>
@@ -100,6 +114,7 @@
           <div class="stat-item"><span class="stat-num">{{ rebuildStatus.total_nodes ?? graphData.nodes.length }}</span><span class="stat-label">数据库总节点数</span></div>
           <div class="stat-item"><span class="stat-num">{{ graphData.nodes.length }}</span><span class="stat-label">当前画布节点数</span></div>
           <div class="stat-item"><span class="stat-num">{{ graphData.edges.length }}</span><span class="stat-label">关系数</span></div>
+          <div v-if="!isSearchMode && graphPageInfo.has_more" class="stat-tip">为避免卡顿，图谱已分包缓存，可继续加载更多节点。</div>
           <div v-if="filter.keyword && highlightedNodes.size" class="stat-item" style="color:#f59e0b">
             <span class="stat-num" style="color:#f59e0b">{{ highlightedNodes.size }}</span><span class="stat-label">匹配节点</span>
           </div>
@@ -233,6 +248,8 @@ const loading = ref(false)
 const subjects = ref([])
 const filter = ref({ subject_id: null, keyword: '' })
 const graphData = ref({ nodes: [], edges: [] })
+const graphPageInfo = ref({ total_nodes: 0, total_edges: 0, next_offset: 0, has_more: false })
+const loadingMoreGraph = ref(false)
 const selectedNode = ref(null)
 const highlightedNodes = ref(new Set())
 const isSearchMode = ref(false)
@@ -248,6 +265,8 @@ const candidateTotal = ref(0)
 let network = null
 let renderedGraphSignature = ''
 let clampGraphView = null
+const GRAPH_PAGE_SIZE = 600
+const graphCache = new Map()
 
 const edgeTypeConfig = {
   PREREQUISITE: { color: '#f472b6', dashes: 'dashed', label: '前置条件' },
@@ -364,7 +383,7 @@ async function reviewCandidate(id, approved) {
   else await rejectRelationCandidate(id)
   ElMessage.success(approved ? '候选关系已批准' : '候选关系已驳回')
   await fetchCandidates()
-  if (approved) fetchGraph()
+  if (approved) refreshGraph()
 }
 
 onActivated(() => {
@@ -384,6 +403,57 @@ function handleResize() {
   if (network && graphRef.value) network.fit({ animation: false })
 }
 
+function graphCacheKey() {
+  return String(filter.value.subject_id || 'all')
+}
+
+function emptyCachedGraph() {
+  return {
+    nodes: [],
+    edges: [],
+    nodeIds: new Set(),
+    edgeIds: new Set(),
+    pageInfo: { total_nodes: 0, total_edges: 0, next_offset: 0, has_more: false },
+  }
+}
+
+function getCachedGraph() {
+  const key = graphCacheKey()
+  if (!graphCache.has(key)) graphCache.set(key, emptyCachedGraph())
+  return graphCache.get(key)
+}
+
+function clearCurrentGraphCache() {
+  graphCache.delete(graphCacheKey())
+}
+
+function mergeGraphPage(cache, data) {
+  for (const node of data.nodes || []) {
+    if (!cache.nodeIds.has(node.id)) {
+      cache.nodeIds.add(node.id)
+      cache.nodes.push(node)
+    }
+  }
+  for (const edge of data.edges || []) {
+    const edgeId = edge.id || `${edge.from}-${edge.to}-${edge.label}`
+    if (!cache.edgeIds.has(edgeId)) {
+      cache.edgeIds.add(edgeId)
+      cache.edges.push({ ...edge, id: edge.id || edgeId })
+    }
+  }
+  cache.pageInfo = {
+    total_nodes: data.total_nodes || cache.nodes.length,
+    total_edges: data.total_edges || cache.edges.length,
+    next_offset: data.next_offset ?? cache.nodes.length,
+    has_more: !!data.has_more,
+  }
+}
+
+async function refreshGraph() {
+  clearCurrentGraphCache()
+  await fetchGraph(false, { force: true })
+}
+
 async function fetchSubjects() {
   try {
     const res = await getSubjects()
@@ -397,7 +467,7 @@ async function fetchSubjects() {
   }
 }
 
-async function fetchGraph(silent = false) {
+async function fetchGraph(silent = false, options = {}) {
   if (!silent) loading.value = true
   try {
     const params = {}
@@ -417,10 +487,20 @@ async function fetchGraph(silent = false) {
     } else {
       isSearchMode.value = false
       highlightedNodes.value = new Set()
-      const res = await getSubgraph(params)
-      if (res.code === 200) {
-        if (res.data.error) throw new Error(res.data.error)
-        graphData.value = { nodes: res.data.nodes || [], edges: res.data.edges || [] }
+      const cache = getCachedGraph()
+      if (!options.force && cache.nodes.length) {
+        graphData.value = { nodes: cache.nodes, edges: cache.edges }
+        graphPageInfo.value = cache.pageInfo
+      } else {
+        const res = await getSubgraph({ ...params, offset: 0, size: GRAPH_PAGE_SIZE })
+        if (res.code === 200) {
+          if (res.data.error) throw new Error(res.data.error)
+          const freshCache = emptyCachedGraph()
+          mergeGraphPage(freshCache, res.data)
+          graphCache.set(graphCacheKey(), freshCache)
+          graphData.value = { nodes: freshCache.nodes, edges: freshCache.edges }
+          graphPageInfo.value = freshCache.pageInfo
+        }
       }
     }
     syncSelectedNode()
@@ -618,12 +698,13 @@ function renderGraph(silent = false) {
   })
 
   const container = graphRef.value
+  const largeGraph = graphData.value.nodes.length > 500
   const options = {
     autoResize: false,
     backgroundColor: 'transparent',
     physics: {
-      enabled: true,
-      stabilization: { iterations: 200, updateInterval: 20 },
+      enabled: !largeGraph,
+      stabilization: { iterations: largeGraph ? 0 : 200, updateInterval: 20 },
       solver: 'forceAtlas2Based',
       forceAtlas2Based: {
         gravitationalConstant: -1500,
@@ -681,7 +762,8 @@ function renderGraph(silent = false) {
   network = new Network(container, { nodes, edges }, options)
 
   // After physics settles: freeze, fit view, lock canvas boundaries
-  network.once('stabilizationIterationsDone', () => {
+  const lockGraphAfterLayout = () => {
+    if (!network) return
     network.setOptions({ physics: { enabled: false } })
     network.fit({ animation: false })
 
@@ -716,7 +798,10 @@ function renderGraph(silent = false) {
 
     network.on('dragEnd', clampGraphView)
     network.on('zoom', clampGraphView)
-  })
+  }
+
+  if (largeGraph) window.setTimeout(lockGraphAfterLayout, 0)
+  else network.once('stabilizationIterationsDone', lockGraphAfterLayout)
 
   network.on('click', (params) => {
     if (params.nodes.length) {
@@ -749,6 +834,35 @@ function fitGraph() {
     network.fit({
       animation: false,
     })
+  }
+}
+
+async function loadMoreGraph() {
+  if (loadingMoreGraph.value || isSearchMode.value || !graphPageInfo.value.has_more) return
+  loadingMoreGraph.value = true
+  try {
+    const params = {}
+    if (filter.value.subject_id) params.subject_id = filter.value.subject_id
+    const cache = getCachedGraph()
+    const res = await getSubgraph({
+      ...params,
+      offset: graphPageInfo.value.next_offset || cache.nodes.length,
+      size: GRAPH_PAGE_SIZE,
+    })
+    if (res.code === 200) {
+      if (res.data.error) throw new Error(res.data.error)
+      mergeGraphPage(cache, res.data)
+      graphData.value = { nodes: cache.nodes, edges: cache.edges }
+      graphPageInfo.value = cache.pageInfo
+      syncSelectedNode()
+      await nextTick()
+      await new Promise(r => requestAnimationFrame(r))
+      renderGraph(false)
+    }
+  } catch (error) {
+    ElMessage.error('加载更多图谱失败：' + (error.message || '网络异常'))
+  } finally {
+    loadingMoreGraph.value = false
   }
 }
 
@@ -806,7 +920,7 @@ async function handleSaveNode() {
       ElMessage.success('创建成功')
     }
     nodeDialog.value = false
-    fetchGraph()
+    refreshGraph()
   } finally {
     saving.value = false
   }
@@ -818,7 +932,7 @@ async function handleDeleteNode(id) {
     ElMessage.success('已删除')
     selectedNode.value = null
     nodeRelations.value = []
-    fetchGraph()
+    refreshGraph()
   } catch {}
 }
 
@@ -895,7 +1009,7 @@ async function handleSaveEdge() {
       ElMessage.success('关系已创建')
     }
     edgeDialog.value = false
-    fetchGraph()
+    refreshGraph()
   } finally {
     saving.value = false
   }
@@ -907,7 +1021,7 @@ async function handleDeleteEdge(id) {
   try {
     await deleteRelation(id)
     ElMessage.success('关系已删除')
-    await fetchGraph()
+    await refreshGraph()
   } finally {
     saving.value = false
   }
@@ -1021,6 +1135,25 @@ async function handleDeleteEdge(id) {
   border: 1px solid rgba(203,213,225,0.3);
 }
 
+.graph-load-panel {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.86);
+  color: #64748b;
+  font-size: 12px;
+  box-shadow: 0 8px 24px rgba(15,23,42,0.08);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(203,213,225,0.45);
+}
+
 /* ── Legend ── */
 .graph-legend {
   display: flex;
@@ -1130,6 +1263,13 @@ async function handleDeleteEdge(id) {
   font-size: 12px;
   color: #94a3b8;
   margin-top: 2px;
+}
+.stat-tip {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 10px 0 0;
+  border-top: 1px solid #f1f5f9;
 }
 
 .rel-item {
