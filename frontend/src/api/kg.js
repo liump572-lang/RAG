@@ -32,6 +32,10 @@ export function createRelation(data) {
   return request.post('/kg/relations', data)
 }
 
+export function updateRelation(id, data) {
+  return request.put(`/kg/relations/${id}`, data)
+}
+
 export function deleteRelation(id) {
   return request.delete(`/kg/relations/${id}`)
 }

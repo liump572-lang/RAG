@@ -87,6 +87,8 @@
               <span class="rel-dot" :style="{ background: edgeTypeConfig[rel.relation_type]?.color || '#999' }"></span>
               <span class="rel-text">{{ rel.target_name }}</span>
               <span class="rel-type">{{ edgeTypeConfig[rel.relation_type]?.label || rel.relation_type }}</span>
+              <el-button size="small" link type="primary" @click.stop="editEdge(rel)">编辑</el-button>
+              <el-button size="small" link type="danger" @click.stop="handleDeleteEdge(rel.id)">删除</el-button>
             </div>
           </div>
           <div class="detail-actions">
@@ -151,7 +153,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="edgeDialog" title="添加关系" width="450px">
+    <el-dialog v-model="edgeDialog" :title="isEditEdge ? '编辑关系' : '添加关系'" width="450px">
       <el-form :model="edgeForm" label-width="90px">
         <el-form-item label="源节点">
           <el-select v-model="edgeForm.source_id" filterable style="width:100%">
@@ -222,7 +224,7 @@ import { ref, computed, onMounted, onBeforeUnmount, onActivated, onDeactivated, 
 import { ElMessage, ElNotification } from 'element-plus'
 import { Network } from 'vis-network'
 import 'vis-network/styles/vis-network.css'
-import { getSubgraph, searchSubgraph, createPoint, updatePoint, deletePoint, createRelation, generateDocument, getRebuildStatus, retryFailedRebuildDocuments, getRelationCandidates, approveRelationCandidate, rejectRelationCandidate } from '@/api/kg'
+import { getSubgraph, searchSubgraph, createPoint, updatePoint, deletePoint, createRelation, updateRelation, deleteRelation, generateDocument, getRebuildStatus, retryFailedRebuildDocuments, getRelationCandidates, approveRelationCandidate, rejectRelationCandidate } from '@/api/kg'
 import { getSubjects } from '@/api/subjects'
 import { useAutoRefresh } from '@/composables/useAutoRefresh'
 
@@ -267,6 +269,7 @@ const nodeRules = {
 }
 
 const edgeDialog = ref(false)
+const isEditEdge = ref(false)
 const edgeForm = ref({ source_id: null, target_id: null, relation_type: 'RELATED', description: '' })
 
 const genDocDialog = ref(false)
@@ -406,6 +409,7 @@ async function fetchGraph(silent = false) {
       const res = await searchSubgraph({ keyword, ...params })
       if (res.code === 200) {
         if (res.data.error) throw new Error(res.data.error)
+        if (res.data.warning) ElMessage.warning(res.data.warning)
         const data = { nodes: res.data.nodes || [], edges: res.data.edges || [] }
         highlightedNodes.value = new Set(data.nodes.map(node => node.id))
         graphData.value = data
@@ -467,7 +471,7 @@ function computeDegree() {
 function graphSignature() {
   return JSON.stringify({
     nodes: graphData.value.nodes.map(n => [n.id, n.label, n.group]),
-    edges: graphData.value.edges.map(e => [e.from, e.to, e.label, e.title]),
+    edges: graphData.value.edges.map(e => [e.id, e.from, e.to, e.label, e.title]),
   })
 }
 
@@ -496,11 +500,25 @@ function relationsForNode(nodeId) {
   for (const edge of graphData.value.edges) {
     if (String(edge.from) === String(nodeId)) {
       const target = graphData.value.nodes.find(node => String(node.id) === String(edge.to))
-      if (target) relations.push({ id: nodeId + '-' + edge.to, target_name: target.label, relation_type: edge.label })
+      if (target) relations.push({
+        id: edge.id,
+        source_id: edge.from,
+        target_id: edge.to,
+        target_name: target.label,
+        relation_type: edge.label,
+        description: edge.description || edge.title || '',
+      })
     }
     if (String(edge.to) === String(nodeId)) {
       const source = graphData.value.nodes.find(node => String(node.id) === String(edge.from))
-      if (source) relations.push({ id: edge.from + '-' + nodeId, target_name: source.label, relation_type: edge.label })
+      if (source) relations.push({
+        id: edge.id,
+        source_id: edge.from,
+        target_id: edge.to,
+        target_name: source.label,
+        relation_type: edge.label,
+        description: edge.description || edge.title || '',
+      })
     }
   }
   return relations
@@ -575,6 +593,7 @@ function renderGraph(silent = false) {
   const edges = graphData.value.edges.map(e => {
     const style = getEdgeStyle(e.label)
     return {
+      id: e.id,
       from: e.from,
       to: e.to,
       label: edgeTypeConfig[e.label]?.label || e.label,
@@ -705,6 +724,10 @@ function renderGraph(silent = false) {
       const node = graphData.value.nodes.find(n => n.id === nodeId)
       selectedNode.value = node || null
       nodeRelations.value = node ? relationsForNode(nodeId) : []
+    } else if (params.edges.length) {
+      const edgeId = params.edges[0]
+      const edge = graphData.value.edges.find(item => String(item.id) === String(edgeId))
+      if (edge) editEdge(edge)
     } else {
       selectedNode.value = null
       nodeRelations.value = []
@@ -731,6 +754,10 @@ function fitGraph() {
 
 async function handleSearch() {
   filter.value.keyword = filter.value.keyword.trim()
+  if (!filter.value.keyword) {
+    await handleClearSearch()
+    return
+  }
   if (filter.value.keyword) {
     await fetchGraph()
     if (highlightedNodes.value.size) {
@@ -822,7 +849,24 @@ async function handleGenerateDoc() {
 }
 
 function showAddEdge() {
+  isEditEdge.value = false
   edgeForm.value = { source_id: null, target_id: null, relation_type: 'RELATED', description: '' }
+  edgeDialog.value = true
+}
+
+function editEdge(edge) {
+  if (!edge?.id) {
+    ElMessage.warning('该关系缺少 ID，请刷新图谱后再编辑')
+    return
+  }
+  isEditEdge.value = true
+  edgeForm.value = {
+    _id: edge.id,
+    source_id: edge.source_id || edge.from,
+    target_id: edge.target_id || edge.to,
+    relation_type: edge.relation_type || edge.label || 'RELATED',
+    description: edge.description || edge.title || '',
+  }
   edgeDialog.value = true
 }
 
@@ -837,10 +881,33 @@ async function handleSaveEdge() {
   }
   saving.value = true
   try {
-    await createRelation(edgeForm.value)
-    ElMessage.success('关系已创建')
+    const payload = {
+      source_id: edgeForm.value.source_id,
+      target_id: edgeForm.value.target_id,
+      relation_type: edgeForm.value.relation_type,
+      description: edgeForm.value.description,
+    }
+    if (isEditEdge.value) {
+      await updateRelation(edgeForm.value._id, payload)
+      ElMessage.success('关系已更新')
+    } else {
+      await createRelation(payload)
+      ElMessage.success('关系已创建')
+    }
     edgeDialog.value = false
     fetchGraph()
+  } finally {
+    saving.value = false
+  }
+}
+
+async function handleDeleteEdge(id) {
+  if (!id) return
+  saving.value = true
+  try {
+    await deleteRelation(id)
+    ElMessage.success('关系已删除')
+    await fetchGraph()
   } finally {
     saving.value = false
   }

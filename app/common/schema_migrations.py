@@ -5,8 +5,8 @@ from sqlalchemy import inspect, text
 from app.database import engine
 
 
-KG_REBUILD_VERSION = "kg-v4-parallel-extraction"
-PREVIOUS_KG_REBUILD_VERSION = "kg-v3-physical-semantic"
+KG_REBUILD_VERSION = "kg-v5-all-entities-search-edit"
+PREVIOUS_KG_REBUILD_VERSION = "kg-v4-parallel-extraction"
 
 
 def ensure_kg_schema():
@@ -78,16 +78,6 @@ def enqueue_auto_rebuild():
 
     db = SessionLocal()
     try:
-        previous = db.query(KgRebuild).filter(KgRebuild.version == PREVIOUS_KG_REBUILD_VERSION).first()
-        if previous and previous.status not in {"success", "partial_failed", "failed"}:
-            from app.models import KgExtractionRun
-            db.query(KgExtractionRun).filter(
-                KgExtractionRun.rebuild_id == previous.id,
-                KgExtractionRun.status.in_(("queued", "running")),
-            ).update({"status": "canceled"}, synchronize_session=False)
-            previous.status = "partial_failed"
-            previous.finished_at = datetime.now()
-            db.commit()
         existing = db.query(KgRebuild).filter(KgRebuild.version == KG_REBUILD_VERSION).first()
         if existing:
             return existing

@@ -14,6 +14,7 @@ from app.modules.kg.schemas import (
     KnowledgePointUpdate,
     RelationCreate,
     RelationResponse,
+    RelationUpdate,
 )
 from app.modules.kg.service import KgService
 
@@ -27,7 +28,7 @@ def get_subgraph(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    data = KgService.get_subgraph(subject_id, depth)
+    data = KgService.get_subgraph(db, subject_id, depth)
     return success_response(data=data)
 
 
@@ -38,7 +39,7 @@ def search_knowledge(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    results = KgService.search(keyword, subject_id)
+    results = KgService.search(db, keyword, subject_id)
     return success_response(data=results)
 
 
@@ -49,7 +50,7 @@ def search_subgraph(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    data = KgService.search_subgraph(keyword, subject_id)
+    data = KgService.search_subgraph(db, keyword, subject_id)
     return success_response(data=data)
 
 
@@ -142,6 +143,28 @@ def create_relation(
     rel = KgService.create_relation(db, body.source_id, body.target_id, body.relation_type, body.description)
     if not rel:
         return error_response(400, "源节点和目标节点必须存在、不能相同且需要属于同一科目")
+    return success_response(data=RelationResponse.model_validate(rel).model_dump())
+
+
+@router.put("/relations/{relation_id}")
+def update_relation(
+    relation_id: int,
+    body: RelationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "admin":
+        return error_response(403, "无权限")
+    rel = KgService.update_relation(
+        db,
+        relation_id,
+        body.source_id,
+        body.target_id,
+        body.relation_type,
+        body.description,
+    )
+    if not rel:
+        return error_response(400, "关系不存在，或源节点和目标节点不存在、相同、跨科目")
     return success_response(data=RelationResponse.model_validate(rel).model_dump())
 
 

@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.common.graph_store import (
@@ -151,21 +152,71 @@ class KgService:
         return rel
 
     @staticmethod
+    def update_relation(
+        db: Session,
+        relation_id: int,
+        source_id: int,
+        target_id: int,
+        relation_type: str,
+        description: str = None,
+    ) -> Optional[KnowledgeRelation]:
+        rel = db.query(KnowledgeRelation).filter(KnowledgeRelation.id == relation_id).first()
+        source = db.query(KnowledgePoint).filter(KnowledgePoint.id == source_id).first()
+        target = db.query(KnowledgePoint).filter(KnowledgePoint.id == target_id).first()
+        if not rel or not source or not target or source.id == target.id or source.subject_id != target.subject_id:
+            return None
+
+        old_payload = {
+            "source_id": rel.source_node_id,
+            "target_id": rel.target_node_id,
+            "relation_type": rel.relation_type,
+        }
+        rel.source_node_id = source_id
+        rel.target_node_id = target_id
+        rel.relation_type = relation_type
+        rel.description = description
+        rel.origin = "manual"
+        rel.review_status = "approved"
+        db.commit()
+        db.refresh(rel)
+
+        try:
+            neo4j_delete_relation(
+                old_payload["source_id"],
+                old_payload["target_id"],
+                old_payload["relation_type"],
+            )
+            neo4j_create_node(source.id, source.name, source.subject_id)
+            neo4j_create_node(target.id, target.name, target.subject_id)
+            neo4j_create_relation(source_id, target_id, relation_type, description)
+        except Exception as exc:
+            _record_sync_failure(db, "upsert", "relation", rel.id, {
+                "old": old_payload,
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation_type": relation_type,
+                "description": description,
+            }, exc)
+
+        return rel
+
+    @staticmethod
     def delete_relation(db: Session, relation_id: int) -> bool:
         rel = db.query(KnowledgeRelation).filter(KnowledgeRelation.id == relation_id).first()
         if not rel:
             return False
+        payload = {
+            "source_id": rel.source_node_id,
+            "target_id": rel.target_node_id,
+            "relation_type": rel.relation_type,
+        }
         db.delete(rel)
         db.commit()
 
         try:
-            neo4j_delete_relation(rel.source_node_id, rel.target_node_id, rel.relation_type)
+            neo4j_delete_relation(payload["source_id"], payload["target_id"], payload["relation_type"])
         except Exception as exc:
-            _record_sync_failure(db, "delete", "relation", rel.id, {
-                "source_id": rel.source_node_id,
-                "target_id": rel.target_node_id,
-                "relation_type": rel.relation_type,
-            }, exc)
+            _record_sync_failure(db, "delete", "relation", relation_id, payload, exc)
 
         return True
 
@@ -336,25 +387,123 @@ class KgService:
         return True
 
     @staticmethod
-    def get_subgraph(subject_id: int = None, depth: int = 2) -> dict:
-        try:
-            return neo4j_get_subgraph(subject_id, depth)
-        except Exception as e:
-            return {"nodes": [], "edges": [], "error": str(e)}
+    def get_subgraph(db: Session, subject_id: int = None, depth: int = 2) -> dict:
+        return KgService._mysql_subgraph(db, subject_id)
 
     @staticmethod
-    def search_subgraph(keyword: str, subject_id: int = None) -> dict:
+    def search_subgraph(db: Session, keyword: str, subject_id: int = None) -> dict:
+        neo4j_error = None
         try:
-            return neo4j_get_search_subgraph(keyword, subject_id, depth=1)
+            data = neo4j_get_search_subgraph(keyword, subject_id, depth=1)
+            if data.get("nodes") or data.get("edges"):
+                return data
         except Exception as e:
-            return {"nodes": [], "edges": [], "error": str(e)}
+            neo4j_error = str(e)
+        data = KgService._mysql_search_subgraph(db, keyword, subject_id)
+        if neo4j_error:
+            data["warning"] = f"Neo4j 查询失败，已使用 MySQL 兜底：{neo4j_error}"
+        return data
 
     @staticmethod
-    def search(keyword: str, subject_id: int = None) -> list:
+    def search(db: Session, keyword: str, subject_id: int = None) -> list:
         try:
-            return neo4j_search_nodes(keyword, subject_id)
+            results = neo4j_search_nodes(keyword, subject_id)
+            if results:
+                return results
         except Exception:
-            return []
+            pass
+        query = db.query(KnowledgePoint)
+        if subject_id:
+            query = query.filter(KnowledgePoint.subject_id == subject_id)
+        return [
+            {"id": point.id, "name": point.name, "subject_id": point.subject_id}
+            for point in query.filter(KnowledgePoint.name.like(f"%{keyword.strip()}%")).limit(50).all()
+        ]
+
+    @staticmethod
+    def _node_payload(point: KnowledgePoint) -> dict:
+        return {
+            "id": point.id,
+            "label": point.name,
+            "subject_id": point.subject_id,
+            "group": str(point.subject_id or 0),
+        }
+
+    @staticmethod
+    def _edge_payload(rel: KnowledgeRelation) -> dict:
+        return {
+            "id": rel.id,
+            "from": rel.source_node_id,
+            "to": rel.target_node_id,
+            "label": rel.relation_type,
+            "title": rel.description or rel.relation_type,
+            "description": rel.description,
+        }
+
+    @staticmethod
+    def _mysql_subgraph(db: Session, subject_id: int = None) -> dict:
+        point_query = db.query(KnowledgePoint)
+        if subject_id:
+            point_query = point_query.filter(KnowledgePoint.subject_id == subject_id)
+        points = point_query.order_by(KnowledgePoint.id).all()
+        point_ids = {point.id for point in points}
+
+        rel_query = db.query(KnowledgeRelation)
+        if subject_id:
+            rel_query = rel_query.join(
+                KnowledgePoint,
+                KnowledgeRelation.source_node_id == KnowledgePoint.id,
+            ).filter(KnowledgePoint.subject_id == subject_id)
+        relations = [
+            rel for rel in rel_query.order_by(KnowledgeRelation.id).all()
+            if rel.source_node_id in point_ids and rel.target_node_id in point_ids
+        ]
+        return {
+            "nodes": [KgService._node_payload(point) for point in points],
+            "edges": [KgService._edge_payload(rel) for rel in relations],
+        }
+
+    @staticmethod
+    def _mysql_search_subgraph(db: Session, keyword: str, subject_id: int = None) -> dict:
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return {"nodes": [], "edges": []}
+
+        point_query = db.query(KnowledgePoint)
+        if subject_id:
+            point_query = point_query.filter(KnowledgePoint.subject_id == subject_id)
+        matched_points = point_query.filter(KnowledgePoint.name.like(f"%{keyword}%")).all()
+
+        rel_query = db.query(KnowledgeRelation)
+        if subject_id:
+            rel_query = rel_query.join(
+                KnowledgePoint,
+                KnowledgeRelation.source_node_id == KnowledgePoint.id,
+            ).filter(KnowledgePoint.subject_id == subject_id)
+        matched_relations = rel_query.filter(or_(
+            KnowledgeRelation.relation_type.like(f"%{keyword}%"),
+            KnowledgeRelation.description.like(f"%{keyword}%"),
+        )).all()
+
+        point_ids = {point.id for point in matched_points}
+        for rel in matched_relations:
+            point_ids.add(rel.source_node_id)
+            point_ids.add(rel.target_node_id)
+
+        if not point_ids:
+            return {"nodes": [], "edges": []}
+
+        visible_points = db.query(KnowledgePoint).filter(KnowledgePoint.id.in_(point_ids)).all()
+        visible_ids = {point.id for point in visible_points}
+        visible_relations = db.query(KnowledgeRelation).filter(
+            KnowledgeRelation.source_node_id.in_(visible_ids),
+            KnowledgeRelation.target_node_id.in_(visible_ids),
+        ).all()
+
+        return {
+            "nodes": [KgService._node_payload(point) for point in visible_points],
+            "edges": [KgService._edge_payload(rel) for rel in visible_relations],
+        }
 
     @staticmethod
     def generate_document(db: Session, subject_id: int, doc_type: str) -> Document:

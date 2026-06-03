@@ -41,6 +41,13 @@ class RelationCreate(BaseModel):
     description: Optional[str] = None
 
 
+class RelationUpdate(BaseModel):
+    source_id: int
+    target_id: int
+    relation_type: str = Field(..., pattern="^(PREREQUISITE|NEXT|RELATED|CONTAINS|CONTRAST|EXAMINED_IN)$")
+    description: Optional[str] = None
+
+
 class RelationResponse(BaseModel):
     id: int
     source_node_id: int

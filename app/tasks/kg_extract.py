@@ -20,7 +20,8 @@ from app.tasks.celery_app import celery_app
 
 BATCH_SIZE = 1
 MAX_CHARS_PER_CHUNK = 1200
-GLOBAL_REL_MAX_ENTITIES = 25
+GLOBAL_REL_WINDOW_SIZE = 80
+GLOBAL_REL_WINDOW_OVERLAP = 10
 PROMPT_VERSION = "kg-v3-physical-semantic"
 VALID_RELATION_TYPES = {
     "PREREQUISITE", "NEXT", "RELATED", "CONTAINS", "CONTRAST", "EXAMINED_IN",
@@ -508,12 +509,18 @@ def _infer_global_relationships(kps: list, doc_title: str, subject_name: str) ->
     if len(kps) < 2:
         return []
 
-    # Sample the complete document evenly so basic concepts are not dropped.
-    if len(kps) > GLOBAL_REL_MAX_ENTITIES:
-        step = len(kps) / GLOBAL_REL_MAX_ENTITIES
-        selected_kps = [kps[int(index * step)] for index in range(GLOBAL_REL_MAX_ENTITIES)]
-    else:
-        selected_kps = kps
+    relationships = []
+    step = max(1, GLOBAL_REL_WINDOW_SIZE - GLOBAL_REL_WINDOW_OVERLAP)
+    for start in range(0, len(kps), step):
+        selected_kps = kps[start:start + GLOBAL_REL_WINDOW_SIZE]
+        if len(selected_kps) < 2:
+            continue
+        relationships.extend(_infer_global_relationship_window(selected_kps, doc_title, subject_name))
+    return _dedup_relations(relationships)
+
+
+def _infer_global_relationship_window(selected_kps: list, doc_title: str, subject_name: str) -> list:
+    """Infer cross-chunk relationships for one bounded entity window."""
 
     kp_text = "\n".join(
         f"{i+1}. {kp['name']}：{kp.get('description', '')}"

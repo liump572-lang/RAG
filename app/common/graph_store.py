@@ -113,7 +113,7 @@ def get_subgraph(subject_id: int = None, depth: int = 2) -> dict:
     if subject_id:
         node_query += " WHERE n.subject_id = $subject_id"
         params["subject_id"] = subject_id
-    node_query += " RETURN n.id as id, n.name as name, n.subject_id as subject_id LIMIT 300"
+    node_query += " RETURN n.id as id, n.name as name, n.subject_id as subject_id"
 
     edge_query = "MATCH (a:KnowledgePoint)-[r:RELATED]->(b:KnowledgePoint)"
     if subject_id:
@@ -122,7 +122,6 @@ def get_subgraph(subject_id: int = None, depth: int = 2) -> dict:
         RETURN a.id as source, a.name as source_name, a.subject_id as source_subject_id,
                b.id as target, b.name as target_name, b.subject_id as target_subject_id,
                r.type as type, r.description as description
-        LIMIT 300
     """
 
     nodes = {_node["id"]: _node_payload(_node) for _node in run_query(node_query, params)}
