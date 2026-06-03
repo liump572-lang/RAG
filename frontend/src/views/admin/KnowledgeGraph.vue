@@ -266,10 +266,10 @@ let network = null
 let renderedGraphSignature = ''
 let clampGraphView = null
 let refreshVisibleLabelsTimer = null
-const GRAPH_PAGE_SIZE = 600
+const GRAPH_PAGE_SIZE = 300
 const LABEL_VISIBILITY_PADDING = 80
-const MAX_VISIBLE_NODE_LABELS = 180
-const MAX_VISIBLE_EDGE_LABELS = 80
+const MAX_VISIBLE_NODE_LABELS = 100
+const MAX_VISIBLE_EDGE_LABELS = 40
 const graphCache = new Map()
 
 const edgeTypeConfig = {
@@ -576,7 +576,7 @@ function isPointInViewport(point, container) {
 }
 
 function updateVisibleLabels() {
-  if (!network || !graphRef.value || graphData.value.nodes.length <= 500) return
+  if (!network || !graphRef.value || graphData.value.nodes.length <= 350) return
   const container = graphRef.value
   const positions = network.getPositions()
   const degree = computeDegree()
@@ -627,7 +627,7 @@ function updateVisibleLabels() {
 }
 
 function scheduleVisibleLabelRefresh(delay = 80) {
-  if (!network || graphData.value.nodes.length <= 500) return
+  if (!network || graphData.value.nodes.length <= 350) return
   if (refreshVisibleLabelsTimer) window.clearTimeout(refreshVisibleLabelsTimer)
   refreshVisibleLabelsTimer = window.setTimeout(() => {
     refreshVisibleLabelsTimer = null
@@ -695,7 +695,7 @@ function renderGraph(silent = false) {
   const hl = highlightedNodes.value
   const degree = computeDegree()
   const maxDeg = Math.max(1, ...Object.values(degree))
-  const largeGraph = graphData.value.nodes.length > 500
+  const largeGraph = graphData.value.nodes.length > 350
 
   const nodes = graphData.value.nodes.map(n => {
     const isHl = hl.size && hl.has(n.id)
@@ -780,12 +780,12 @@ function renderGraph(silent = false) {
       stabilization: { iterations: largeGraph ? 0 : 200, updateInterval: 20 },
       solver: 'forceAtlas2Based',
       forceAtlas2Based: {
-        gravitationalConstant: largeGraph ? -4200 : -2600,
+        gravitationalConstant: -6500,
         centralGravity: 0.001,
-        springLength: largeGraph ? 760 : 620,
-        springConstant: largeGraph ? 0.003 : 0.004,
+        springLength: 900,
+        springConstant: 0.0025,
         damping: 0.4,
-        avoidOverlap: 1.6,
+        avoidOverlap: 2,
       },
       maxVelocity: 15,
       minVelocity: 0.1,
@@ -896,7 +896,7 @@ function renderGraph(silent = false) {
 
   network.on('doubleClick', () => { fitGraph() })
   network.on('dragStart', () => {
-    if (graphData.value.nodes.length > 500) {
+    if (graphData.value.nodes.length > 350) {
       network.body.data.nodes.update(graphData.value.nodes.map(node => ({ id: node.id, label: '' })))
       network.body.data.edges.update(graphData.value.edges.map(edge => ({ id: edge.id, label: '' })))
     }
