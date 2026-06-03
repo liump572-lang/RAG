@@ -265,7 +265,11 @@ const candidateTotal = ref(0)
 let network = null
 let renderedGraphSignature = ''
 let clampGraphView = null
+let refreshVisibleLabelsTimer = null
 const GRAPH_PAGE_SIZE = 600
+const LABEL_VISIBILITY_PADDING = 80
+const MAX_VISIBLE_NODE_LABELS = 180
+const MAX_VISIBLE_EDGE_LABELS = 80
 const graphCache = new Map()
 
 const edgeTypeConfig = {
@@ -559,7 +563,76 @@ function destroyNetwork() {
   if (network) network.destroy()
   network = null
   clampGraphView = null
+  if (refreshVisibleLabelsTimer) window.clearTimeout(refreshVisibleLabelsTimer)
+  refreshVisibleLabelsTimer = null
   renderedGraphSignature = ''
+}
+
+function isPointInViewport(point, container) {
+  return point.x >= -LABEL_VISIBILITY_PADDING &&
+    point.x <= container.clientWidth + LABEL_VISIBILITY_PADDING &&
+    point.y >= -LABEL_VISIBILITY_PADDING &&
+    point.y <= container.clientHeight + LABEL_VISIBILITY_PADDING
+}
+
+function updateVisibleLabels() {
+  if (!network || !graphRef.value || graphData.value.nodes.length <= 500) return
+  const container = graphRef.value
+  const positions = network.getPositions()
+  const degree = computeDegree()
+  const selectedIds = new Set(network.getSelectedNodes?.() || [])
+  const visibleNodes = []
+
+  for (const node of graphData.value.nodes) {
+    const position = positions[node.id]
+    if (!position) continue
+    const point = network.canvasToDOM(position)
+    if (!isPointInViewport(point, container) && !highlightedNodes.value.has(node.id) && !selectedIds.has(node.id)) continue
+    visibleNodes.push({
+      id: node.id,
+      label: node.label,
+      score: (highlightedNodes.value.has(node.id) ? 10000 : 0) + (selectedIds.has(node.id) ? 20000 : 0) + (degree[node.id] || 0),
+    })
+  }
+
+  visibleNodes.sort((a, b) => b.score - a.score)
+  const visibleLabelIds = new Set(visibleNodes.slice(0, MAX_VISIBLE_NODE_LABELS).map(node => node.id))
+  const nodeUpdates = graphData.value.nodes.map(node => ({
+    id: node.id,
+    label: visibleLabelIds.has(node.id) ? node.label : '',
+  }))
+  network.body.data.nodes.update(nodeUpdates)
+
+  const visibleEdges = []
+  for (const edge of graphData.value.edges) {
+    const from = positions[edge.from]
+    const to = positions[edge.to]
+    if (!from || !to) continue
+    const midpoint = network.canvasToDOM({ x: (from.x + to.x) / 2, y: (from.y + to.y) / 2 })
+    if (!isPointInViewport(midpoint, container)) continue
+    visibleEdges.push({
+      id: edge.id,
+      label: edgeTypeConfig[edge.label]?.label || edge.label,
+      score: (degree[edge.from] || 0) + (degree[edge.to] || 0),
+    })
+  }
+
+  visibleEdges.sort((a, b) => b.score - a.score)
+  const visibleEdgeLabelIds = new Set(visibleEdges.slice(0, MAX_VISIBLE_EDGE_LABELS).map(edge => edge.id))
+  const edgeUpdates = graphData.value.edges.map(edge => ({
+    id: edge.id,
+    label: visibleEdgeLabelIds.has(edge.id) ? (edgeTypeConfig[edge.label]?.label || edge.label) : '',
+  }))
+  network.body.data.edges.update(edgeUpdates)
+}
+
+function scheduleVisibleLabelRefresh(delay = 80) {
+  if (!network || graphData.value.nodes.length <= 500) return
+  if (refreshVisibleLabelsTimer) window.clearTimeout(refreshVisibleLabelsTimer)
+  refreshVisibleLabelsTimer = window.setTimeout(() => {
+    refreshVisibleLabelsTimer = null
+    updateVisibleLabels()
+  }, delay)
 }
 
 function syncSelectedNode() {
@@ -622,6 +695,7 @@ function renderGraph(silent = false) {
   const hl = highlightedNodes.value
   const degree = computeDegree()
   const maxDeg = Math.max(1, ...Object.values(degree))
+  const largeGraph = graphData.value.nodes.length > 500
 
   const nodes = graphData.value.nodes.map(n => {
     const isHl = hl.size && hl.has(n.id)
@@ -631,7 +705,7 @@ function renderGraph(silent = false) {
 
     return {
       id: n.id,
-      label: n.label,
+      label: largeGraph ? '' : n.label,
       group: n.group || '0',
       title: '<div style="padding:8px 12px;font-size:13px;line-height:1.6"><b style="color:#334155">' + n.label + '</b><br/><span style="color:#94a3b8;font-size:12px">关联 ' + nodeDeg + ' 个节点</span></div>',
       size: isHl ? Math.max(scaledSize + 6, 44) : scaledSize,
@@ -676,7 +750,7 @@ function renderGraph(silent = false) {
       id: e.id,
       from: e.from,
       to: e.to,
-      label: edgeTypeConfig[e.label]?.label || e.label,
+      label: largeGraph ? '' : (edgeTypeConfig[e.label]?.label || e.label),
       title: e.title || e.label,
       arrows: { to: { enabled: true, scaleFactor: 0.6, type: 'arrow' } },
       font: {
@@ -698,7 +772,6 @@ function renderGraph(silent = false) {
   })
 
   const container = graphRef.value
-  const largeGraph = graphData.value.nodes.length > 500
   const options = {
     autoResize: false,
     backgroundColor: 'transparent',
@@ -707,12 +780,12 @@ function renderGraph(silent = false) {
       stabilization: { iterations: largeGraph ? 0 : 200, updateInterval: 20 },
       solver: 'forceAtlas2Based',
       forceAtlas2Based: {
-        gravitationalConstant: -1500,
+        gravitationalConstant: largeGraph ? -4200 : -2600,
         centralGravity: 0.001,
-        springLength: 500,
-        springConstant: 0.005,
+        springLength: largeGraph ? 760 : 620,
+        springConstant: largeGraph ? 0.003 : 0.004,
         damping: 0.4,
-        avoidOverlap: 1,
+        avoidOverlap: 1.6,
       },
       maxVelocity: 15,
       minVelocity: 0.1,
@@ -798,6 +871,7 @@ function renderGraph(silent = false) {
 
     network.on('dragEnd', clampGraphView)
     network.on('zoom', clampGraphView)
+    scheduleVisibleLabelRefresh(0)
   }
 
   if (largeGraph) window.setTimeout(lockGraphAfterLayout, 0)
@@ -817,9 +891,18 @@ function renderGraph(silent = false) {
       selectedNode.value = null
       nodeRelations.value = []
     }
+    scheduleVisibleLabelRefresh()
   })
 
   network.on('doubleClick', () => { fitGraph() })
+  network.on('dragStart', () => {
+    if (graphData.value.nodes.length > 500) {
+      network.body.data.nodes.update(graphData.value.nodes.map(node => ({ id: node.id, label: '' })))
+      network.body.data.edges.update(graphData.value.edges.map(edge => ({ id: edge.id, label: '' })))
+    }
+  })
+  network.on('dragEnd', () => scheduleVisibleLabelRefresh())
+  network.on('zoom', () => scheduleVisibleLabelRefresh())
 }
 
 function fitGraph() {
